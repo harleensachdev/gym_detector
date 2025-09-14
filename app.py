@@ -4,6 +4,7 @@ import sys
 from io import BytesIO
 from PIL import Image
 import logging
+import gc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,13 +21,14 @@ def load_model():
     global model, MODEL_LOADED
     
     try:
-        # Try to import ultralytics
         from ultralytics import YOLO
         logger.info("Successfully imported ultralytics")
         
-        # Look for model files in order of preference
         model_files = [
-            "model_epoch_85.pt"
+            "best_model.pt",
+            "model_epoch_85.pt", 
+            "best.pt",
+            "last.pt"
         ]
         
         model_path = None
@@ -41,10 +43,9 @@ def load_model():
             model = YOLO(model_path)
             MODEL_LOADED = True
             logger.info(f"Model loaded successfully with {len(model.names)} classes")
-            logger.info(f"Classes: {list(model.names.values())}")
         else:
             logger.warning("No model file found, using YOLOv8n as fallback")
-            model = YOLO('yolov8n.pt')  # This will download automatically
+            model = YOLO('yolov8n.pt')
             MODEL_LOADED = True
             logger.info("Fallback model loaded successfully")
             
@@ -55,7 +56,30 @@ def load_model():
         logger.error(f"Failed to load model: {e}")
         MODEL_LOADED = False
 
-# Try to load model on startup
+def optimize_image(image, max_size=640):
+    """Resize image to reduce memory usage and processing time"""
+    # Get original dimensions
+    width, height = image.size
+    
+    # Calculate scaling factor
+    if max(width, height) > max_size:
+        if width > height:
+            new_width = max_size
+            new_height = int((height * max_size) / width)
+        else:
+            new_height = max_size
+            new_width = int((width * max_size) / height)
+        
+        logger.info(f"Resizing image from {width}x{height} to {new_width}x{new_height}")
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    return image
+
+def cleanup_memory():
+    """Force garbage collection to free memory"""
+    gc.collect()
+
+# Load model on startup
 logger.info("Starting model loading...")
 load_model()
 
@@ -67,62 +91,35 @@ def health_check():
         "model_loaded": MODEL_LOADED,
         "python_version": sys.version,
         "available_classes": list(model.names.values()) if MODEL_LOADED and model else [],
-        "message": "YOLO Gym Equipment Detection API" if MODEL_LOADED else "Model loading failed - check logs"
+        "message": "YOLO Gym Equipment Detection API - Optimized for Free Tier"
     })
-
-@app.route('/status', methods=['GET'])
-def detailed_status():
-    """Detailed status for debugging"""
-    status_info = {
-        "model_loaded": MODEL_LOADED,
-        "python_version": sys.version,
-        "working_directory": os.getcwd(),
-        "files_in_directory": os.listdir('.'),
-    }
-    
-    if MODEL_LOADED and model:
-        status_info["num_classes"] = len(model.names)
-        status_info["class_names"] = list(model.names.values())
-    
-    # Check for common issues
-    try:
-        import torch
-        status_info["torch_version"] = torch.__version__
-        status_info["cuda_available"] = torch.cuda.is_available()
-    except:
-        status_info["torch_available"] = False
-        
-    try:
-        import cv2
-        status_info["opencv_version"] = cv2.__version__
-    except:
-        status_info["opencv_available"] = False
-        
-    return jsonify(status_info)
 
 @app.route('/detect', methods=['POST'])
 def detect_objects():
-    """Main detection endpoint with comprehensive error handling"""
+    """Main detection endpoint - optimized for low memory"""
     if not MODEL_LOADED or model is None:
         return jsonify({
             "success": False,
-            "error": "Model not loaded. Check /status endpoint for details."
+            "error": "Model not loaded"
         }), 500
     
     try:
+        # Clean up memory before processing
+        cleanup_memory()
+        
         # Get image data
         if 'image' in request.files:
             file = request.files['image']
             image_data = file.read()
-            logger.info(f"Received file upload: {file.filename}, size: {len(image_data)} bytes")
+            logger.info(f"File upload: {len(image_data)} bytes")
         else:
             image_data = request.get_data()
-            logger.info(f"Received raw image data, size: {len(image_data)} bytes")
+            logger.info(f"Raw data: {len(image_data)} bytes")
 
-        if not image_data or len(image_data) < 100:  # Minimum reasonable image size
+        if not image_data or len(image_data) < 100:
             return jsonify({
                 "success": False,
-                "error": "No valid image data provided"
+                "error": "No valid image data"
             }), 400
 
         # Convert to PIL Image
@@ -130,68 +127,97 @@ def detect_objects():
             image = Image.open(BytesIO(image_data))
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-            logger.info(f"Image loaded: {image.size}, mode: {image.mode}")
+            logger.info(f"Original image: {image.size}")
+            
+            # CRITICAL: Resize image to reduce memory usage
+            image = optimize_image(image, max_size=416)  # Smaller size for free tier
+            logger.info(f"Optimized image: {image.size}")
+            
         except Exception as e:
-            logger.error(f"Failed to decode image: {e}")
+            logger.error(f"Image processing failed: {e}")
             return jsonify({
                 "success": False,
-                "error": f"Invalid image format: {str(e)}"
+                "error": f"Invalid image: {str(e)}"
             }), 400
 
-        # Run inference
-        logger.info("Running YOLO inference...")
-        results = model(image, verbose=False)
-        logger.info(f"Inference completed, {len(results)} result objects")
+        # Run inference with optimized settings
+        logger.info("Starting inference...")
+        try:
+            # Use minimal settings to reduce memory usage
+            results = model(
+                image, 
+                verbose=False,
+                imgsz=416,      # Small image size
+                conf=0.25,      # Higher confidence threshold
+                iou=0.45,       # Standard IoU
+                max_det=100,    # Limit detections
+                device='cpu'    # Force CPU to avoid GPU memory issues
+            )
+            logger.info("Inference completed")
+            
+        except Exception as e:
+            logger.error(f"Inference failed: {e}")
+            cleanup_memory()
+            return jsonify({
+                "success": False,
+                "error": f"Model inference failed: {str(e)}"
+            }), 500
 
-        # Parse results
+        # Parse results quickly
         detections = []
-        for result in results:
-            if result.boxes is not None and len(result.boxes) > 0:
-                logger.info(f"Found {len(result.boxes)} detections")
-                
-                for box in result.boxes:
-                    # Get normalized coordinates
-                    x1, y1, x2, y2 = box.xyxyn[0].tolist()
-                    confidence = float(box.conf[0])
-                    class_id = int(box.cls[0])
-                    class_name = model.names[class_id]
+        try:
+            for result in results:
+                if result.boxes is not None and len(result.boxes) > 0:
+                    logger.info(f"Processing {len(result.boxes)} detections")
                     
-                    # Convert to center format
-                    center_x = (x1 + x2) / 2
-                    center_y = (y1 + y2) / 2
-                    width = x2 - x1
-                    height = y2 - y1
-                    
-                    detection = {
-                        "className": class_name,
-                        "confidence": confidence,
-                        "boundingBox": {
-                            "x": center_x - width/2,
-                            "y": center_y - height/2,
-                            "width": width,
-                            "height": height
+                    for box in result.boxes:
+                        # Get normalized coordinates
+                        x1, y1, x2, y2 = box.xyxyn[0].tolist()
+                        confidence = float(box.conf[0])
+                        class_id = int(box.cls[0])
+                        class_name = model.names[class_id]
+                        
+                        # Convert to center format
+                        center_x = (x1 + x2) / 2
+                        center_y = (y1 + y2) / 2
+                        width = x2 - x1
+                        height = y2 - y1
+                        
+                        detection = {
+                            "className": class_name,
+                            "confidence": confidence,
+                            "boundingBox": {
+                                "x": center_x - width/2,
+                                "y": center_y - height/2,
+                                "width": width,
+                                "height": height
+                            }
                         }
-                    }
-                    
-                    detections.append(detection)
-                    logger.info(f"Detection: {class_name} ({confidence:.2f})")
-            else:
-                logger.info("No detections found in this result")
-
-        logger.info(f"Returning {len(detections)} total detections")
+                        
+                        detections.append(detection)
+                        logger.info(f"Detection: {class_name} ({confidence:.2f})")
+                
+        except Exception as e:
+            logger.error(f"Results parsing failed: {e}")
+        
+        # Clean up memory after processing
+        cleanup_memory()
+        
+        logger.info(f"Returning {len(detections)} detections")
         return jsonify({
             "success": True,
             "detections": detections,
             "count": len(detections),
-            "model_classes": list(model.names.values())
+            "processing_note": "Image was resized for optimal performance on free tier"
         })
 
     except Exception as e:
         logger.error(f"Detection error: {str(e)}", exc_info=True)
+        cleanup_memory()
         return jsonify({
             "success": False,
-            "error": f"Detection failed: {str(e)}",
-            "error_type": type(e).__name__
+            "error": f"Processing failed: {str(e)}",
+            "suggestion": "Try a smaller image or better lighting"
         }), 500
 
 @app.route('/classes', methods=['GET'])
@@ -207,16 +233,15 @@ def get_classes():
 
 @app.route('/test', methods=['GET'])
 def test_model():
-    """Test endpoint with a synthetic image"""
+    """Test with small synthetic image"""
     if not MODEL_LOADED or model is None:
         return jsonify({"error": "Model not loaded"}), 500
     
     try:
-        # Create a simple test image
-        test_image = Image.new('RGB', (640, 640), color='red')
+        # Create small test image
+        test_image = Image.new('RGB', (320, 320), color='blue')
         
-        # Run detection
-        results = model(test_image, verbose=False)
+        results = model(test_image, verbose=False, imgsz=320)
         
         detection_count = 0
         for result in results:
@@ -225,9 +250,8 @@ def test_model():
         
         return jsonify({
             "success": True,
-            "message": "Model test completed",
-            "detections_found": detection_count,
-            "model_classes": list(model.names.values())
+            "message": "Test completed",
+            "detections_found": detection_count
         })
         
     except Exception as e:
@@ -238,13 +262,11 @@ def test_model():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
-    logger.info(f"Starting Flask app on port {port}")
-    logger.info(f"Model loaded: {MODEL_LOADED}")
-    
+    # Optimized settings for free tier
     app.run(
         host='0.0.0.0', 
         port=port, 
-        debug=debug_mode
+        debug=False,        # Disable debug mode
+        threaded=True       # Enable threading
     )
