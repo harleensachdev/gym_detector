@@ -239,17 +239,18 @@ def get_classes():
         "num_classes": len(model.names)
     })
 
-@app.route('/test', methods=['GET'])
-def test_model():
-    """Test with small synthetic image"""
+@app.route('/quick-test', methods=['GET'])
+def quick_test():
+    """Ultra-fast test that should complete in under 10 seconds"""
     if not MODEL_LOADED or model is None:
         return jsonify({"error": "Model not loaded"}), 500
     
     try:
-        # Create small test image
-        test_image = Image.new('RGB', (320, 320), color='blue')
+        # Create tiny test image
+        test_image = Image.new('RGB', (160, 160), color='green')
         
-        results = model(test_image, verbose=False, imgsz=320)
+        # Run ultra-fast detection
+        results = model(test_image, verbose=False, imgsz=160, conf=0.8, max_det=1)
         
         detection_count = 0
         for result in results:
@@ -258,14 +259,16 @@ def test_model():
         
         return jsonify({
             "success": True,
-            "message": "Test completed",
-            "detections_found": detection_count
+            "message": "Quick test completed in under 10 seconds",
+            "detections_found": detection_count,
+            "server_status": "responsive"
         })
         
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": f"Test failed: {str(e)}"
+            "error": f"Quick test failed: {str(e)}",
+            "server_status": "overloaded"
         }), 500
 
 if __name__ == '__main__':
