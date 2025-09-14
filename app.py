@@ -5,6 +5,8 @@ from io import BytesIO
 from PIL import Image
 import logging
 import gc
+import threading
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -15,10 +17,17 @@ app = Flask(__name__)
 # Global model variable
 model = None
 MODEL_LOADED = False
+MODEL_LOADING = False
 
 def load_model():
-    """Load YOLO model with error handling"""
-    global model, MODEL_LOADED
+    """Load YOLO model with error handling - called during startup"""
+    global model, MODEL_LOADED, MODEL_LOADING
+    
+    if MODEL_LOADING or MODEL_LOADED:
+        return
+    
+    MODEL_LOADING = True
+    logger.info("Starting model loading process...")
     
     try:
         from ultralytics import YOLO
@@ -45,9 +54,15 @@ def load_model():
             logger.info(f"Model loaded successfully with {len(model.names)} classes")
         else:
             logger.warning("No model file found, using YOLOv8n as fallback")
+            # Use nano model for faster loading
             model = YOLO('yolov8n.pt')
             MODEL_LOADED = True
             logger.info("Fallback model loaded successfully")
+            
+        # Warm up the model with a dummy inference
+        dummy_img = Image.new('RGB', (160, 160), color='red')
+        _ = model(dummy_img, verbose=False, imgsz=160, conf=0.8, max_det=1)
+        logger.info("Model warmed up successfully")
             
     except ImportError as e:
         logger.error(f"Failed to import required packages: {e}")
@@ -55,13 +70,13 @@ def load_model():
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         MODEL_LOADED = False
+    finally:
+        MODEL_LOADING = False
 
 def optimize_image(image, max_size=640):
     """Resize image to reduce memory usage and processing time"""
-    # Get original dimensions
     width, height = image.size
     
-    # Calculate scaling factor
     if max(width, height) > max_size:
         if width > height:
             new_width = max_size
@@ -97,14 +112,23 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "model_loaded": MODEL_LOADED,
+        "model_loading": MODEL_LOADING,
         "python_version": sys.version,
         "available_classes": list(model.names.values()) if MODEL_LOADED and model else [],
-        "message": "YOLO Gym Equipment Detection API - Optimized for Free Tier"
+        "message": "YOLO Gym Equipment Detection API - Railway Optimized"
     })
 
 @app.route('/detect', methods=['POST'])
 def detect_objects():
-    """Main detection endpoint - optimized for low memory"""
+    """Main detection endpoint - optimized for Railway"""
+    # Check if model is still loading
+    if MODEL_LOADING:
+        return jsonify({
+            "success": False,
+            "error": "Model is still loading, please wait a moment and try again",
+            "retry_after": 10
+        }), 503
+    
     if not MODEL_LOADED or model is None:
         return jsonify({
             "success": False,
@@ -138,7 +162,7 @@ def detect_objects():
             logger.info(f"Original image: {image.size}")
             
             # CRITICAL: Resize image to reduce memory usage
-            image = optimize_image(image, max_size=416)  # Smaller size for free tier
+            image = optimize_image(image, max_size=384)  # Even smaller for Railway
             logger.info(f"Optimized image: {image.size}")
             
         except Exception as e:
@@ -151,15 +175,17 @@ def detect_objects():
         # Run inference with optimized settings
         logger.info("Starting inference...")
         try:
-            # Use minimal settings to reduce memory usage
+            # Use minimal settings to reduce memory usage and processing time
             results = model(
                 image, 
                 verbose=False,
-                imgsz=416,      # Small image size
-                conf=0.25,      # Higher confidence threshold
+                imgsz=384,      # Smaller image size for Railway
+                conf=0.3,       # Higher confidence threshold
                 iou=0.45,       # Standard IoU
-                max_det=100,    # Limit detections
-                device='cpu'    # Force CPU to avoid GPU memory issues
+                max_det=50,     # Limit detections more aggressively
+                device='cpu',   # Force CPU
+                half=False,     # Disable half precision to avoid issues
+                augment=False   # Disable augmentation for speed
             )
             logger.info("Inference completed")
             
@@ -216,7 +242,7 @@ def detect_objects():
             "success": True,
             "detections": detections,
             "count": len(detections),
-            "processing_note": "Image was resized for optimal performance on free tier"
+            "processing_note": "Image optimized for Railway deployment"
         })
 
     except Exception as e:
@@ -231,6 +257,12 @@ def detect_objects():
 @app.route('/classes', methods=['GET'])
 def get_classes():
     """Get available classes"""
+    if MODEL_LOADING:
+        return jsonify({
+            "status": "loading",
+            "message": "Model is still loading"
+        }), 503
+    
     if not MODEL_LOADED or model is None:
         return jsonify({"error": "Model not loaded"}), 500
     
@@ -241,7 +273,14 @@ def get_classes():
 
 @app.route('/quick-test', methods=['GET'])
 def quick_test():
-    """Ultra-fast test that should complete in under 10 seconds"""
+    """Ultra-fast test that should complete quickly"""
+    if MODEL_LOADING:
+        return jsonify({
+            "success": False,
+            "status": "loading",
+            "message": "Model is still loading"
+        }), 503
+    
     if not MODEL_LOADED or model is None:
         return jsonify({"error": "Model not loaded"}), 500
     
@@ -259,7 +298,7 @@ def quick_test():
         
         return jsonify({
             "success": True,
-            "message": "Quick test completed in under 10 seconds",
+            "message": "Quick test completed",
             "detections_found": detection_count,
             "server_status": "responsive"
         })
@@ -268,16 +307,29 @@ def quick_test():
         return jsonify({
             "success": False,
             "error": f"Quick test failed: {str(e)}",
-            "server_status": "overloaded"
+            "server_status": "error"
         }), 500
 
+# Load model when the application starts
+@app.before_first_request
+def initialize():
+    """Initialize model loading before first request"""
+    if not MODEL_LOADED and not MODEL_LOADING:
+        # Load model in background thread to avoid blocking
+        threading.Thread(target=load_model, daemon=True).start()
+
 if __name__ == '__main__':
+    # Load model immediately when running directly
+    if not MODEL_LOADED:
+        load_model()
+    
     port = int(os.environ.get('PORT', 5000))
     
-    # Optimized settings for free tier
+    # Optimized settings for Railway
     app.run(
         host='0.0.0.0', 
         port=port, 
         debug=False,        # Disable debug mode
-        threaded=True       # Enable threading
+        threaded=True,      # Enable threading
+        use_reloader=False  # Disable reloader for production
     )
