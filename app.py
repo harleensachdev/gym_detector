@@ -79,9 +79,17 @@ def cleanup_memory():
     """Force garbage collection to free memory"""
     gc.collect()
 
-# Load model on startup
-logger.info("Starting model loading...")
-load_model()
+# Configure Flask for better upload handling
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB max file size
+
+@app.before_request
+def limit_content_length():
+    """Reject oversized requests early"""
+    if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        return jsonify({
+            "success": False,
+            "error": "Image too large. Please use a smaller image (under 2MB)."
+        }), 413
 
 @app.route('/', methods=['GET'])
 def health_check():
