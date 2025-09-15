@@ -9,6 +9,7 @@ from PIL import Image
 import logging
 import requests
 from pathlib import Path
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -29,76 +30,75 @@ DEPENDENCIES_INSTALLED = False
 # Configuration
 MAX_IMAGE_SIZE = 640
 MAX_CONTENT_LENGTH = 5 * 1024 * 1024
-MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=1A9z88pRkkWwdF0LNUMxlVq11kG8nNI60")
+
+# Use your ONNX model from Google Drive
+# Get the direct download link from your Google Drive ONNX model
+MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=1JBZHN-gwW4ukfMbfI7N-gIlU8iaXp1I_")
+CLASS_NAMES = [
+    "arm_curl",
+    "chest_fly",
+    "chest_press",
+    "chin_dip",
+    "dumbell",
+    "lat_pulldown",
+    "lateral_raises",
+    "leg_curl",
+    "leg_extension",
+    "leg_press",
+    "seated_cable_row",
+    "seated_dip",
+    "shoulder_press",
+    "smith_machine"
+  ]  # Update with your actual classes
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
-def install_ml_dependencies():
-    """Install ML dependencies at runtime to avoid build timeout"""
+def install_minimal_dependencies():
+    """Install only minimal dependencies for inference"""
     global DEPENDENCIES_INSTALLED, ML_ERROR
     
     if DEPENDENCIES_INSTALLED:
         return True
     
-    logger.info("Installing ML dependencies at runtime...")
+    logger.info("Installing minimal ML dependencies...")
     
     try:
-        # Install minimal packages first
+        # Only install what we absolutely need
         packages = [
             'numpy==1.24.3',
-            'ultralytics==8.0.200',
-            'opencv-python-headless==4.8.1.78',
+            'onnxruntime==1.16.0',  # Much smaller than PyTorch
+            'scipy==1.11.4',        # For NMS if needed
         ]
         
-        # Install torch separately with CPU-only version
-        torch_packages = [
-            '--index-url', 'https://download.pytorch.org/whl/cpu',
-            'torch==2.0.1+cpu',
-            'torchvision==0.15.2+cpu'
-        ]
-        
-        logger.info("Installing basic packages...")
-        result1 = subprocess.run(
+        logger.info("Installing minimal packages...")
+        result = subprocess.run(
             [sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + packages,
             capture_output=True,
             text=True,
-            timeout=180  # 3 minutes
+            timeout=120
         )
         
-        if result1.returncode != 0:
-            logger.error(f"Basic packages failed: {result1.stderr}")
-            ML_ERROR = "Failed to install basic ML packages"
-            return False
-        
-        logger.info("Installing PyTorch CPU...")
-        result2 = subprocess.run(
-            [sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + torch_packages,
-            capture_output=True,
-            text=True,
-            timeout=180  # 3 minutes
-        )
-        
-        if result2.returncode != 0:
-            logger.error(f"PyTorch installation failed: {result2.stderr}")
-            ML_ERROR = "Failed to install PyTorch"
+        if result.returncode != 0:
+            logger.error(f"Installation failed: {result.stderr}")
+            ML_ERROR = "Failed to install minimal ML packages"
             return False
             
-        logger.info("✅ ML dependencies installed successfully!")
+        logger.info("✅ Minimal dependencies installed successfully!")
         DEPENDENCIES_INSTALLED = True
         return True
             
     except subprocess.TimeoutExpired:
         logger.error("Installation timed out")
-        ML_ERROR = "ML dependency installation timed out"
+        ML_ERROR = "Dependency installation timed out"
         return False
     except Exception as e:
         logger.error(f"Installation error: {e}")
         ML_ERROR = str(e)
         return False
 
-def load_model_lazy():
-    """Load model only when needed"""
-    global ML_READY, ML_LOADING, ML_ERROR
+def load_onnx_model():
+    """Load lightweight ONNX model"""
+    global ML_READY, ML_LOADING, ML_ERROR, onnx_session
     
     if ML_READY or ML_LOADING:
         return ML_READY
@@ -106,30 +106,28 @@ def load_model_lazy():
     ML_LOADING = True
     
     try:
-        # First install dependencies if needed
-        if not install_ml_dependencies():
+        # Install minimal dependencies
+        if not install_minimal_dependencies():
             ML_LOADING = False
             return False
         
-        # Now import and load model
-        from ultralytics import YOLO
+        import onnxruntime as ort
         
-        # Download model if needed
-        model_path = "/tmp/model.pt"
+        # Download ONNX model (much smaller than PyTorch)
+        model_path = "/tmp/model.onnx"
         if not os.path.exists(model_path):
-            logger.info("Downloading model...")
-            response = requests.get(MODEL_URL, timeout=120, stream=True)
+            logger.info("Downloading ONNX model...")
+            response = requests.get(MODEL_URL, timeout=60, stream=True)
             response.raise_for_status()
             
             with open(model_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            logger.info(f"Model downloaded: {os.path.getsize(model_path) / 1024 / 1024:.1f}MB")
+            logger.info(f"ONNX model downloaded: {os.path.getsize(model_path) / 1024 / 1024:.1f}MB")
         
-        # Load model
-        global model
-        model = YOLO(model_path)
-        logger.info("✅ Model loaded successfully!")
+        # Load ONNX model
+        onnx_session = ort.InferenceSession(model_path)
+        logger.info("✅ ONNX Model loaded successfully!")
         
         ML_READY = True
         ML_LOADING = False
@@ -141,10 +139,72 @@ def load_model_lazy():
         ML_LOADING = False
         return False
 
-# Basic Flask routes that work without ML
+def preprocess_image(image):
+    """Minimal image preprocessing for YOLO"""
+    # Resize image
+    if max(image.size) > MAX_IMAGE_SIZE:
+        ratio = MAX_IMAGE_SIZE / max(image.size)
+        new_size = tuple(int(dim * ratio) for dim in image.size)
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    # Convert to RGB
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # Convert to numpy array and normalize
+    img_array = np.array(image).astype(np.float32)
+    img_array = img_array / 255.0  # Normalize to 0-1
+    
+    # Add batch dimension and transpose to CHW format
+    img_array = img_array.transpose(2, 0, 1)  # HWC to CHW
+    img_array = np.expand_dims(img_array, axis=0)  # Add batch dimension
+    
+    return img_array, image.size
+
+def postprocess_detections(outputs, original_size, conf_threshold=0.25):
+    """Process ONNX model outputs"""
+    # This depends on your specific ONNX model output format
+    # Typical YOLO output is [batch, detections, 5+classes]
+    detections = []
+    
+    try:
+        predictions = outputs[0][0]  # Remove batch dimension
+        
+        for detection in predictions:
+            confidence = detection[4]  # Objectness score
+            
+            if confidence > conf_threshold:
+                # Extract bounding box (assuming normalized coordinates)
+                x_center, y_center, width, height = detection[:4]
+                
+                # Get class scores
+                class_scores = detection[5:]
+                class_id = np.argmax(class_scores)
+                class_confidence = class_scores[class_id]
+                
+                final_confidence = confidence * class_confidence
+                
+                if final_confidence > conf_threshold:
+                    detections.append({
+                        "className": CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"class_{class_id}",
+                        "confidence": float(final_confidence),
+                        "boundingBox": {
+                            "x": float(x_center - width/2),
+                            "y": float(y_center - height/2),
+                            "width": float(width),
+                            "height": float(height)
+                        }
+                    })
+    
+    except Exception as e:
+        logger.error(f"Postprocessing error: {e}")
+    
+    return detections
+
+# Basic Flask routes
 @app.route('/', methods=['GET'])
 def health():
-    """Health check - always works"""
+    """Health check"""
     uptime = time.time() - start_time
     
     return jsonify({
@@ -153,87 +213,29 @@ def health():
         "ml_loading": ML_LOADING,
         "ml_error": ML_ERROR,
         "uptime": round(uptime, 1),
-        "message": "API is running. ML features will load on first use.",
-        "endpoints": ["/", "/quick-test", "/process-image", "/detect", "/install-ml"]
+        "message": "Lightweight ONNX API is running",
+        "model_type": "ONNX (minimal dependencies)",
+        "endpoints": ["/", "/detect"]
     })
-
-@app.route('/quick-test', methods=['GET'])
-def quick_test():
-    """Quick test that doesn't need ML"""
-    return jsonify({
-        "success": True,
-        "message": "Server is responsive!",
-        "ml_available": ML_READY,
-        "timestamp": time.time()
-    })
-
-@app.route('/process-image', methods=['POST'])
-def process_image():
-    """Simple image processing without ML"""
-    try:
-        # Get image
-        if 'image' in request.files:
-            file = request.files['image']
-            image_data = file.read()
-        elif request.content_type and 'image' in request.content_type:
-            image_data = request.get_data()
-        else:
-            return jsonify({"error": "No image data found"}), 400
-        
-        if not image_data:
-            return jsonify({"error": "Empty image data"}), 400
-        
-        # Basic image processing
-        try:
-            image = Image.open(BytesIO(image_data))
-        except Exception as e:
-            return jsonify({"error": f"Invalid image format: {e}"}), 400
-        
-        # Get image info
-        width, height = image.size
-        mode = image.mode
-        
-        # Resize if needed
-        if max(width, height) > MAX_IMAGE_SIZE:
-            ratio = MAX_IMAGE_SIZE / max(width, height)
-            new_size = (int(width * ratio), int(height * ratio))
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
-        
-        return jsonify({
-            "success": True,
-            "original_size": [width, height],
-            "processed_size": list(image.size),
-            "mode": mode,
-            "format": image.format,
-            "message": "Image processed successfully"
-        })
-        
-    except Exception as e:
-        logger.error(f"Image processing error: {e}")
-        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
 
 @app.route('/detect', methods=['POST'])
 def detect():
-    """ML detection - loads dependencies on first use"""
+    """Lightweight ML detection using ONNX"""
     
-    # Load ML on first request
+    # Load ONNX model on first request
     if not ML_READY:
         if ML_LOADING:
             return jsonify({
                 "success": False,
-                "error": "ML is loading, please wait and retry in 60 seconds...",
-                "retry_after": 60,
+                "error": "Model is loading, please wait...",
+                "retry_after": 30,
                 "status": "loading"
             }), 503
         
-        # Start loading
-        logger.info("First ML request - installing dependencies...")
-        
-        # Try to load ML (this will take time)
-        if not load_model_lazy():
+        if not load_onnx_model():
             return jsonify({
                 "success": False,
-                "error": "ML initialization failed. The server is still running but ML features are unavailable.",
+                "error": "Model initialization failed",
                 "details": ML_ERROR,
                 "status": "failed"
             }), 500
@@ -257,69 +259,33 @@ def detect():
         except Exception as e:
             return jsonify({"error": f"Invalid image format: {e}"}), 400
         
-        # Resize if needed
-        if max(image.size) > MAX_IMAGE_SIZE:
-            ratio = MAX_IMAGE_SIZE / max(image.size)
-            new_size = tuple(int(dim * ratio) for dim in image.size)
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        # Preprocess for ONNX model
+        processed_image, original_size = preprocess_image(image)
         
-        # Run detection
-        results = model(image, conf=0.25, device='cpu', verbose=False)
+        # Run ONNX inference
+        input_name = onnx_session.get_inputs()[0].name
+        outputs = onnx_session.run(None, {input_name: processed_image})
         
-        # Parse results
-        detections = []
-        for r in results:
-            if r.boxes is not None:
-                for box in r.boxes:
-                    x1, y1, x2, y2 = box.xyxyn[0].tolist()
-                    detections.append({
-                        "className": model.names[int(box.cls[0])],
-                        "confidence": float(box.conf[0]),
-                        "boundingBox": {
-                            "x": (x1 + x2) / 2 - (x2 - x1) / 2,
-                            "y": (y1 + y2) / 2 - (y2 - y1) / 2,
-                            "width": x2 - x1,
-                            "height": y2 - y1
-                        }
-                    })
+        # Postprocess results
+        detections = postprocess_detections(outputs, original_size)
         
         return jsonify({
             "success": True,
             "detections": detections,
             "count": len(detections),
-            "image_size": list(image.size)
+            "image_size": list(original_size),
+            "model_type": "ONNX"
         })
         
     except NameError:
-        # Model not loaded yet
         return jsonify({
             "success": False,
-            "error": "ML model not ready yet. Please try again in a few seconds.",
+            "error": "ONNX model not ready",
             "status": "not_ready"
         }), 503
     except Exception as e:
         logger.error(f"Detection error: {e}")
         return jsonify({"error": f"Detection failed: {str(e)}"}), 500
-
-@app.route('/install-ml', methods=['POST'])
-def install_ml():
-    """Manually trigger ML installation"""
-    if ML_READY:
-        return jsonify({"message": "ML already ready", "status": "ready"})
-    
-    if ML_LOADING:
-        return jsonify({"message": "ML is loading...", "status": "loading"})
-    
-    # Start installation in background
-    import threading
-    thread = threading.Thread(target=load_model_lazy, daemon=True)
-    thread.start()
-    
-    return jsonify({
-        "message": "ML installation started. This will take 2-3 minutes.",
-        "check_status": "GET /",
-        "status": "started"
-    })
 
 # Error handlers
 @app.errorhandler(413)
@@ -332,8 +298,8 @@ def internal_error(e):
     return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
-    logger.info("🚀 Starting Ultra-Light API Server...")
-    logger.info("Server will start immediately. ML features will be installed on first use.")
+    logger.info("🚀 Starting Ultra-Lightweight ONNX API Server...")
+    logger.info("Dependencies: numpy, onnxruntime, pillow only")
     
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")

@@ -1,33 +1,18 @@
+# Ultra-minimal version for development/testing
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    libgomp1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# Only install curl for health checks
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Copy and install dependencies
+# Copy and install
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip cache purge && \
-    rm -rf ~/.cache/pip
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
 COPY app.py .
-
-# Create non-root user
-RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app && \
-    mkdir -p /tmp/models && \
-    chown -R appuser:appuser /tmp/models
-
-USER appuser
 
 EXPOSE 5000
 
-# Try Flask development server first to test
+# Simple development server
 CMD ["python", "app.py"]
