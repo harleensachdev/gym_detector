@@ -1,8 +1,7 @@
-Flask==2.3.3
-ultralytics>=8.0.100
-opencv-python-headless>=4.5.0
-Pillow>=9.0.0
-numpy>=1.21.0
-torch>=1.12.0
-torchvision>=0.13.0
-gunicorn==21.2.0
+flask==2.3.3
+ultralytics==8.0.196
+pillow==10.0.1
+numpy==1.24.3
+opencv-python-headless==4.8.1.78
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
