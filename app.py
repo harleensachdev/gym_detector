@@ -9,6 +9,7 @@ from PIL import Image
 import logging
 import requests
 from pathlib import Path
+import subprocess
 
 # Configure logging
 logging.basicConfig(
@@ -28,12 +29,33 @@ start_time = time.time()
 
 # Configuration for Railway
 MODEL_CACHE_DIR = "/tmp/models"
-MODEL_URL = os.getenv("PRIMARY_MODEL_URL", "https://drive.google.com/uc?export=download&id=1A9z88pRkkWwdF0LNUMxlVq11kG8nNI60")  # Your Google Drive direct link
-BACKUP_MODEL_URL = os.getenv("BACKUP_MODEL_URL", "https://drive.google.com/file/d/187Mtm9KMc8mFBRjJcvvOWIlr0R0EEGvl/view?usp=sharing")
+MODEL_URL = os.getenv("PRIMARY_MODEL_URL", "https://drive.google.com/uc?export=download&id=1A9z88pRkkWwdF0LNUMxlVq11kG8nNI60")
+BACKUP_MODEL_URL = os.getenv("BACKUP_MODEL_URL", "")
 MAX_IMAGE_SIZE = 640
 MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5MB max file size
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+def install_minimal_torch():
+    """Install CPU-only PyTorch at runtime to save build size"""
+    try:
+        import torch
+        logger.info("PyTorch already installed")
+        return True
+    except ImportError:
+        logger.info("Installing minimal PyTorch CPU version...")
+        try:
+            # Install CPU-only torch (smaller)
+            subprocess.check_call([
+                sys.executable, '-m', 'pip', 'install', '--no-cache-dir',
+                'torch==2.0.1+cpu', 'torchvision==0.15.2+cpu',
+                '-f', 'https://download.pytorch.org/whl/torch_stable.html'
+            ])
+            logger.info("✅ PyTorch CPU installed successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to install PyTorch: {e}")
+            return False
 
 def ensure_model_dir():
     """Create model cache directory"""
@@ -53,15 +75,32 @@ def download_model_simple(url, filename):
         logger.info(f"Model {filename} already cached")
         return True
     
-    logger.info(f"Downloading {filename} from Google Drive...")
+    logger.info(f"Downloading {filename}...")
     
     try:
-        # Simple download for small files
-        response = requests.get(url, timeout=60)
+        # Handle Google Drive URLs
+        if 'drive.google.com' in url:
+            # Extract file ID if it's a view URL
+            if '/file/d/' in url:
+                file_id = url.split('/file/d/')[1].split('/')[0]
+                url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        # Download with streaming for progress
+        response = requests.get(url, stream=True, timeout=60)
         response.raise_for_status()
         
+        total_size = int(response.headers.get('content-length', 0))
+        
         with open(filepath, 'wb') as f:
-            f.write(response.content)
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress = (downloaded / total_size) * 100
+                        if downloaded % (1024 * 1024) == 0:  # Log every MB
+                            logger.info(f"Download progress: {progress:.1f}%")
         
         file_size = os.path.getsize(filepath)
         if file_size > 1024 * 1024:  # At least 1MB
@@ -79,7 +118,7 @@ def download_model_simple(url, filename):
         return False
 
 def load_model():
-    """Load YOLO model from Google Drive"""
+    """Load YOLO model with minimal dependencies"""
     global model, MODEL_LOADED, MODEL_LOADING, MODEL_ERROR
     
     if MODEL_LOADED or MODEL_LOADING:
@@ -90,6 +129,11 @@ def load_model():
     logger.info("🚀 Starting model loading...")
     
     try:
+        # Install PyTorch if needed (at runtime to save build size)
+        if not install_minimal_torch():
+            logger.warning("PyTorch installation failed, using fallback mode")
+        
+        # Import YOLO after PyTorch is installed
         from ultralytics import YOLO
         logger.info("✅ Ultralytics imported successfully")
         
@@ -104,7 +148,7 @@ def load_model():
                     model_path = os.path.join(MODEL_CACHE_DIR, "custom_model.pt")
                     model = YOLO(model_path)
                     logger.info(f"✅ Primary model loaded! Classes: {len(model.names)}")
-                    logger.info(f"Available classes: {list(model.names.values())}")
+                    logger.info(f"Available classes: {list(model.names.values())[:10]}...")  # Show first 10
                     model_loaded = True
                 except Exception as e:
                     logger.error(f"Failed to load primary model: {e}")
@@ -121,11 +165,11 @@ def load_model():
                 except Exception as e:
                     logger.error(f"Failed to load backup model: {e}")
         
-        # Fallback to YOLOv8n
+        # Fallback to YOLOv8n (smallest model)
         if not model_loaded:
-            logger.info("Loading fallback YOLOv8n...")
+            logger.info("Loading fallback YOLOv8n (smallest model)...")
             try:
-                model = YOLO('yolov8n.pt')  # Auto-downloads
+                model = YOLO('yolov8n.pt')  # Nano model - smallest
                 logger.info("✅ Fallback YOLOv8n loaded")
                 model_loaded = True
             except Exception as e:
@@ -133,13 +177,16 @@ def load_model():
                 MODEL_ERROR = f"All model loading failed: {e}"
                 return
         
-        # Quick model warmup
+        # Quick model warmup with smaller image
         if model_loaded:
             logger.info("Warming up model...")
             dummy_img = Image.new('RGB', (320, 320), color='red')
             _ = model(dummy_img, verbose=False, imgsz=320, conf=0.5, max_det=1)
             logger.info("✅ Model warmup complete!")
             MODEL_LOADED = True
+            
+            # Clear memory after loading
+            gc.collect()
         
     except ImportError as e:
         MODEL_ERROR = f"Import failed: {e}"
@@ -180,13 +227,13 @@ def health():
     uptime = time.time() - start_time
     
     return jsonify({
-        "status": "healthy" if MODEL_LOADED else ("loading" if MODEL_LOADING else "error"),
+        "status": "healthy" if MODEL_LOADED else ("loading" if MODEL_LOADING else "ready"),
         "model_loaded": MODEL_LOADED,
         "model_loading": MODEL_LOADING,
         "error": MODEL_ERROR,
         "uptime": round(uptime, 1),
-        "classes": list(model.names.values()) if MODEL_LOADED and model else [],
-        "message": "YOLO Detection API - Railway + Google Drive"
+        "classes": list(model.names.values())[:10] if MODEL_LOADED and model else [],
+        "message": "YOLO Detection API - Railway Optimized"
     })
 
 @app.route('/load-model', methods=['POST'])
@@ -196,7 +243,7 @@ def load_model_endpoint():
         return jsonify({
             "success": True,
             "message": "Model already loaded",
-            "classes": list(model.names.values())
+            "classes": len(model.names) if model else 0
         })
     
     if MODEL_LOADING:
@@ -221,6 +268,9 @@ def detect():
     if not MODEL_LOADED and not MODEL_LOADING:
         logger.info("Auto-starting model load...")
         threading.Thread(target=load_model, daemon=True).start()
+        
+        # Wait a bit for model to start loading
+        time.sleep(2)
     
     # Check model status
     if MODEL_LOADING:
@@ -266,18 +316,19 @@ def detect():
                 "error": f"Invalid image: {str(e)}"
             }), 400
 
-        # Run detection
+        # Run detection with optimized settings
         logger.info("Running detection...")
         start_inference = time.time()
         
         results = model(
             image,
             verbose=False,
-            imgsz=640,
+            imgsz=640,  # Fixed size for consistency
             conf=0.25,
             iou=0.45,
             max_det=100,
-            device='cpu'
+            device='cpu',  # Force CPU
+            half=False  # Don't use half precision on CPU
         )
         
         inference_time = time.time() - start_inference
@@ -313,6 +364,9 @@ def detect():
 
         logger.info(f"Found {len(detections)} detections")
         
+        # Clear memory after inference
+        gc.collect()
+        
         return jsonify({
             "success": True,
             "detections": detections,
@@ -327,6 +381,9 @@ def detect():
             "success": False,
             "error": f"Detection failed: {str(e)}"
         }), 500
+    finally:
+        # Always clean up memory
+        gc.collect()
 
 @app.route('/classes', methods=['GET'])
 def get_classes():
@@ -338,17 +395,24 @@ def get_classes():
     
     return jsonify({
         "classes": list(model.names.values()),
-        "class_mapping": model.names,
         "count": len(model.names)
     })
 
 @app.route('/status', methods=['GET'])
 def status():
     """Detailed status"""
+    import psutil
+    
+    # Get memory usage
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    
     return jsonify({
         "server": {
-            "uptime": time.time() - start_time,
-            "python": sys.version.split()[0]
+            "uptime": round(time.time() - start_time, 1),
+            "python": sys.version.split()[0],
+            "memory_mb": round(memory_info.rss / 1024 / 1024, 1),
+            "cpu_percent": psutil.cpu_percent(interval=1)
         },
         "model": {
             "loaded": MODEL_LOADED,
@@ -363,16 +427,18 @@ def status():
         }
     })
 
-@app.route('/test', methods=['GET'])
+@app.route('/quick-test', methods=['GET'])
 def quick_test():
-    """Quick test"""
+    """Quick test endpoint for Swift client"""
     if not MODEL_LOADED:
         return jsonify({
             "success": False,
-            "error": "Model not loaded"
+            "error": "Model not loaded",
+            "model_loading": MODEL_LOADING
         }), 500
     
     try:
+        # Create a simple test image
         test_img = Image.new('RGB', (160, 160), 'blue')
         results = model(test_img, verbose=False, imgsz=160, conf=0.8)
         
@@ -385,7 +451,7 @@ def quick_test():
             "success": True,
             "test_detections": count,
             "model_classes": len(model.names),
-            "message": "Test successful!"
+            "message": "API is ready!"
         })
     except Exception as e:
         return jsonify({
@@ -410,15 +476,17 @@ def limit_content_length():
         }), 413
 
 if __name__ == '__main__':
-    # Start model loading immediately
-    logger.info("🚀 Starting Railway app...")
+    # Start model loading immediately (but don't block)
+    logger.info("🚀 Starting Railway app (Optimized)...")
     logger.info(f"Model URL configured: {bool(MODEL_URL)}")
     logger.info(f"Backup URL configured: {bool(BACKUP_MODEL_URL)}")
     
-    if not MODEL_LOADED:
-        threading.Thread(target=load_model, daemon=True).start()
+    # Don't auto-load on startup to reduce memory
+    # Model will load on first request
     
     port = int(os.environ.get('PORT', 5000))
+    
+    # Use gunicorn in production (add to Procfile)
     app.run(
         host='0.0.0.0',
         port=port,

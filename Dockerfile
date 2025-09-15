@@ -1,48 +1,47 @@
-# Use Python slim image
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies including OpenGL libraries
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    wget \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
+# Install minimal runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     libgomp1 \
     libglib2.0-0 \
-    libgtk-3-dev \
-    libavcodec-dev \
-    libavformat-dev \
-    libswscale-dev \
+    libgl1 \
+    libgthread-2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python packages
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip cache purge
+# Install Python packages with no cache
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip cache purge && \
+    rm -rf ~/.cache/pip
 
 # Copy application code
-COPY . .
+COPY app.py .
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash appuser && \
-    chown -R appuser:appuser /app
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app && \
+    mkdir -p /tmp/models && \
+    chown -R appuser:appuser /tmp/models
+
 USER appuser
 
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:${PORT:-5000}/ || exit 1
+
 # Expose port
-EXPOSE 5000
+EXPOSE ${PORT:-5000}
 
-# Set environment variables for headless operation
-ENV PYTHONPATH=/app
-ENV QT_QPA_PLATFORM=offscreen
-
-# Run the application
-CMD ["python", "app.py"]
+# Run with gunicorn for production
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "2", "--timeout", "120"]

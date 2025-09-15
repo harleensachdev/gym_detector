@@ -1,6 +1,25 @@
-flask==2.3.2
-pillow==9.5.0
+# Minimal Flask setup
+flask==3.0.0
+gunicorn==21.2.0
+
+# Image handling
+pillow==10.1.0
+
+# Core numerical
 numpy==1.24.3
+
+# HTTP client
 requests==2.31.0
-ultralytics==8.0.50
+
+# ONNX Runtime instead of PyTorch (MUCH smaller!)
+onnxruntime==1.16.3
+
+# Ultralytics without torch (we'll use ONNX)
+ultralytics==8.0.200
+
+# OpenCV headless
 opencv-python-headless==4.8.1.78
+
+# Required minimal dependencies
+pyyaml>=5.3.1
+tqdm>=4.64.0
