@@ -1,18 +1,48 @@
-# Ultra-minimal version for development/testing
+# Use Python 3.11 slim image
 FROM python:3.11-slim
 
+# Set environment variables to prevent threading issues
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+ENV OMP_DYNAMIC=FALSE
+
+# Install system dependencies and tools to handle executable stack
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    make \
+    execstack \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
 WORKDIR /app
 
-# Only install curl for health checks
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
-
-# Copy and install
+# Copy requirements first for better caching
 COPY requirements.txt .
+
+# Install Python packages
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Try to fix executable stack issues for ONNX Runtime
+RUN find /usr/local/lib/python*/site-packages/onnxruntime -name "*.so" -exec execstack -c {} \; 2>/dev/null || true
+
+# Copy application files
 COPY app.py .
 
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash app
+RUN chown -R app:app /app
+USER app
+
+# Expose port
 EXPOSE 5000
 
-# Simple development server
-CMD ["python", "app.py"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:5000/ || exit 1
+
+# Run with gunicorn for production
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "2", "--timeout", "120", "app:app"]

@@ -99,15 +99,18 @@ def load_onnx_model():
         else:
             logger.info(f"Using existing model: {os.path.getsize(model_path) / 1024 / 1024:.1f}MB")
         
-        # Load ONNX model with CPU provider only
+        # Load ONNX model with strict CPU-only execution
         providers = ['CPUExecutionProvider']
-        logger.info("Creating ONNX inference session...")
+        provider_options = [{'arena_extend_strategy': 'kSameAsRequested'}]
+        
+        logger.info("Creating ONNX inference session with CPU-only execution...")
         
         try:
             onnx_session = ort.InferenceSession(
                 model_path, 
                 sess_options=sess_options,
-                providers=providers
+                providers=providers,
+                provider_options=provider_options
             )
             
             logger.info("✅ CPU-only ONNX Model loaded successfully!")
