@@ -4,6 +4,8 @@ __pycache__/
 *.pyd
 .Python
 env/
+.env
+.venv/
 pip-log.txt
 pip-delete-this-directory.txt
 .tox
@@ -15,11 +17,12 @@ coverage.xml
 *.cover
 *.log
 .git
-.mypy_cache
-.pytest_cache
-.hypothesis
+.gitignore
+README.md
 .DS_Store
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
+node_modules/
+.pytest_cache/
+.mypy_cache/
