@@ -5,3 +5,6 @@ numpy==1.24.3
 opencv-python-headless==4.8.1.78
 torch==2.0.1+cpu
 torchvision==0.15.2+cpu
+psutil==5.9.5
+requests==2.31.0
+gdown==4.7.1
