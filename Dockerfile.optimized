@@ -2,29 +2,25 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install minimal runtime dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Install system dependencies needed for runtime ML installation
+# libgomp1 and libglib2.0-0 are needed for OpenCV when it gets installed later
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     libgomp1 \
     libglib2.0-0 \
-    libgl1 \
-    libgthread-2.0-0 \
-    curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Copy requirements first for better caching
+# Copy and install minimal Python dependencies
 COPY requirements.txt .
-
-# Install Python packages with no cache
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip cache purge && \
     rm -rf ~/.cache/pip
 
-# Copy application code
+# Copy application
 COPY app.py .
 
-# Create non-root user
+# Create non-root user and necessary directories
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app && \
     mkdir -p /tmp/models && \
@@ -32,16 +28,7 @@ RUN useradd -m -u 1000 appuser && \
 
 USER appuser
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
+EXPOSE 5000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-5000}/ || exit 1
-
-# Expose port
-EXPOSE ${PORT:-5000}
-
-# Run with gunicorn for production
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "2", "--timeout", "120"]
+# Use longer timeout for ML installation requests
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "600", "--worker-class", "sync", "app:app"]
