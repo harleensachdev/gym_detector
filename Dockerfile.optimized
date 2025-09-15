@@ -2,8 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies needed for runtime ML installation
-# libgomp1 and libglib2.0-0 are needed for OpenCV when it gets installed later
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libgomp1 \
@@ -11,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Copy and install minimal Python dependencies
+# Copy and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip cache purge && \
@@ -20,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Copy application
 COPY app.py .
 
-# Create non-root user and necessary directories
+# Create non-root user
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app && \
     mkdir -p /tmp/models && \
@@ -30,5 +29,5 @@ USER appuser
 
 EXPOSE 5000
 
-# Use longer timeout for ML installation requests
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "600", "--worker-class", "sync", "app:app"]
+# Try Flask development server first to test
+CMD ["python", "app.py"]
