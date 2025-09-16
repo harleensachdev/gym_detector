@@ -43,63 +43,83 @@ CLASS_NAMES = [
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 def load_onnx_model():
-    """Load lightweight ONNX model with error handling"""
+    """Load 5MB ONNX model on startup - fast and reliable"""
     global ML_READY, ML_LOADING, ML_ERROR, onnx_session
     
     if ML_READY or ML_LOADING:
         return ML_READY
     
     ML_LOADING = True
-    logger.info("🔄 Loading ONNX model...")
+    logger.info("🚀 Loading 5MB ONNX model on startup...")
     
     try:
         import onnxruntime as ort
+        logger.info("✅ ONNX Runtime imported successfully")
         
-        # Download ONNX model if not exists
+        # Download model with aggressive timeouts for Railway
         model_path = "/tmp/model.onnx"
         if not os.path.exists(model_path):
-            logger.info("📥 Downloading 5MB ONNX model...")
+            logger.info("📥 Downloading 5MB model from Google Drive...")
+            start_download = time.time()
             
-            # Add timeout and retry logic
-            for attempt in range(3):
-                try:
-                    response = requests.get(MODEL_URL, timeout=60, stream=True)
-                    response.raise_for_status()
-                    
-                    with open(model_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    
-                    model_size = os.path.getsize(model_path) / 1024 / 1024
-                    logger.info(f"✅ Model downloaded: {model_size:.1f}MB")
-                    break
-                    
-                except Exception as e:
-                    logger.warning(f"Download attempt {attempt + 1} failed: {e}")
-                    if attempt == 2:
-                        raise
-                    time.sleep(2)
+            # Fast download with shorter timeouts - it's only 5MB!
+            try:
+                response = requests.get(
+                    MODEL_URL, 
+                    timeout=30,  # 30s should be plenty for 5MB
+                    stream=True,
+                    headers={'User-Agent': 'Railway-ML-Server/1.0'}
+                )
+                response.raise_for_status()
+                
+                downloaded_size = 0
+                with open(model_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=32768):  # Larger chunks
+                        if chunk:
+                            f.write(chunk)
+                            downloaded_size += len(chunk)
+                
+                download_time = time.time() - start_download
+                model_size = os.path.getsize(model_path) / 1024 / 1024
+                logger.info(f"✅ Model downloaded: {model_size:.1f}MB in {download_time:.1f}s")
+                
+                if model_size < 1:  # Sanity check
+                    raise Exception(f"Downloaded file too small: {model_size:.1f}MB")
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"❌ Download failed: {e}")
+                raise Exception(f"Model download failed: {str(e)}")
         
-        # Load ONNX model with optimizations
-        providers = ['CPUExecutionProvider']
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        else:
+            model_size = os.path.getsize(model_path) / 1024 / 1024
+            logger.info(f"📁 Using cached model: {model_size:.1f}MB")
+        
+        # Load ONNX model quickly - no fancy optimizations needed for 5MB
+        logger.info("🔄 Loading ONNX session...")
+        start_load = time.time()
         
         onnx_session = ort.InferenceSession(
-            model_path, 
-            sess_options=sess_options,
-            providers=providers
+            model_path,
+            providers=['CPUExecutionProvider']  # Simple and fast
         )
         
-        logger.info("✅ ONNX Model loaded successfully!")
+        load_time = time.time() - start_load
+        logger.info(f"✅ ONNX session loaded in {load_time:.1f}s")
+        
+        # Verify model inputs/outputs
+        input_name = onnx_session.get_inputs()[0].name
+        input_shape = onnx_session.get_inputs()[0].shape
+        logger.info(f"✅ Model ready - Input: {input_name} {input_shape}")
+        
         ML_READY = True
         ML_LOADING = False
+        logger.info("🎉 5MB ONNX model fully loaded and ready!")
         return True
         
     except Exception as e:
-        logger.error(f"❌ Model loading failed: {e}")
-        ML_ERROR = str(e)
+        error_msg = f"Model loading failed: {str(e)}"
+        logger.error(f"❌ {error_msg}")
+        ML_ERROR = error_msg
         ML_LOADING = False
         return False
 
@@ -170,27 +190,30 @@ def postprocess_detections(outputs, original_size, conf_threshold=0.25, nms_thre
 # Flask routes
 @app.route('/', methods=['GET'])
 def health():
-    """Railway-compatible health check"""
+    """Railway health check - model MUST be loaded"""
     uptime = time.time() - start_time
     
+    # Health check fails if model isn't ready (forces proper startup)
+    if not ML_READY:
+        logger.warning(f"⚠️ Health check - Model not ready yet (uptime: {uptime:.1f}s)")
+        return jsonify({
+            "status": "starting",
+            "service": "Gym Equipment Detection API", 
+            "model_ready": False,
+            "model_loading": ML_LOADING,
+            "error": ML_ERROR,
+            "uptime": round(uptime, 1)
+        }), 503  # Service unavailable until model loads
+    
+    logger.info(f"✅ Health check passed - Model ready (uptime: {uptime:.1f}s)")
     return jsonify({
         "status": "healthy",
         "service": "Gym Equipment Detection API",
-        "ml_ready": ML_READY,
-        "ml_loading": ML_LOADING,
-        "ml_error": ML_ERROR,
+        "model_ready": True,
         "uptime_seconds": round(uptime, 1),
-        "model_type": "ONNX (5MB)",
-        "platform": "Railway",
-        "endpoints": {
-            "health": "/",
-            "detect": "/detect"
-        },
-        "limits": {
-            "max_image_size": f"{MAX_CONTENT_LENGTH // 1024 // 1024}MB",
-            "max_resolution": f"{MAX_IMAGE_SIZE}px"
-        }
-    })
+        "model_size": "5MB ONNX",
+        "endpoints": ["/", "/detect"]
+    }), 200
 
 @app.route('/detect', methods=['POST'])
 def detect():
@@ -306,26 +329,29 @@ def internal_error(e):
         "error": "Internal server error"
     }), 500
 
-# Auto-load model on startup for Railway
-def initialize_model():
-    """Initialize model on startup"""
-    logger.info("🚀 Railway startup - pre-loading model...")
-    load_onnx_model()
-
 if __name__ == '__main__':
-    logger.info("🚀 Starting Ultra-Lightweight Gym Detection API")
-    logger.info("📦 Dependencies: Flask, ONNX Runtime, PIL, NumPy only")
-    logger.info("🏋️ Model: 5MB Gym Equipment Detection")
+    logger.info("🚀 Starting Gym Detection API with 5MB model preload")
+    logger.info("📦 Platform: Railway | Model: ONNX | Size: 5MB")
     
-    # Get port from Railway environment
+    # Get Railway port
     port = int(os.environ.get('PORT', 5000))
+    logger.info(f"🌐 Port: {port}")
     
-    # Pre-load model for Railway
-    initialize_model()
+    # FORCE model loading on startup - this is what you want!
+    logger.info("⚡ PRE-LOADING 5MB MODEL ON STARTUP...")
+    startup_start = time.time()
     
-    logger.info(f"🌐 Server starting on port {port}")
+    if load_onnx_model():
+        startup_time = time.time() - startup_start
+        logger.info(f"🎉 SUCCESS! Model loaded in {startup_time:.1f}s - ready for requests!")
+    else:
+        logger.error("❌ STARTUP FAILED - Model could not load")
+        logger.error(f"Error details: {ML_ERROR}")
+        sys.exit(1)  # Crash if model doesn't load - Railway will restart
     
-    # Railway-optimized settings
+    logger.info(f"🚀 Starting Flask server on 0.0.0.0:{port}")
+    
+    # Start server with model already loaded
     app.run(
         host='0.0.0.0',
         port=port,
