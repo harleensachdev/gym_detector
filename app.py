@@ -1,17 +1,21 @@
 from flask import Flask, request, jsonify
 import os
+import sys
 import time
+import subprocess
 import json
 from io import BytesIO
 from PIL import Image
 import logging
 import requests
+from pathlib import Path
 import numpy as np
 
-# Configure logging
+# Configure logging for Railway
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
@@ -24,260 +28,149 @@ ML_ERROR = None
 start_time = time.time()
 onnx_session = None
 
-# Configuration
+# Railway-optimized configuration
 MAX_IMAGE_SIZE = 640
-MAX_CONTENT_LENGTH = 5 * 1024 * 1024
+MAX_CONTENT_LENGTH = 2 * 1024 * 1024  # 2MB limit for Railway
 
 # Use your ONNX model from Google Drive
 MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=1JBZHN-gwW4ukfMbfI7N-gIlU8iaXp1I_")
 CLASS_NAMES = [
-    "arm_curl",
-    "chest_fly",
-    "chest_press",
-    "chin_dip",
-    "dumbell",
-    "lat_pulldown",
-    "lateral_raises",
-    "leg_curl",
-    "leg_extension",
-    "leg_press",
-    "seated_cable_row",
-    "seated_dip",
-    "shoulder_press",
-    "smith_machine"
+    "arm_curl", "chest_fly", "chest_press", "chin_dip", "dumbell",
+    "lat_pulldown", "lateral_raises", "leg_curl", "leg_extension",
+    "leg_press", "seated_cable_row", "seated_dip", "shoulder_press", "smith_machine"
 ]
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 def load_onnx_model():
-    """Load lightweight ONNX model with CPU-only runtime"""
+    """Load lightweight ONNX model with error handling"""
     global ML_READY, ML_LOADING, ML_ERROR, onnx_session
     
     if ML_READY or ML_LOADING:
         return ML_READY
     
     ML_LOADING = True
-    logger.info("Starting model loading...")
+    logger.info("🔄 Loading ONNX model...")
     
     try:
-        # Import ONNX Runtime (should be pre-installed)
-        try:
-            import onnxruntime as ort
-            logger.info(f"ONNX Runtime version: {ort.__version__}")
-        except ImportError as e:
-            logger.error("ONNX Runtime not found. Make sure it's installed.")
-            ML_ERROR = "ONNX Runtime not installed"
-            ML_LOADING = False
-            return False
-        
-        # Create CPU-only session options
-        sess_options = ort.SessionOptions()
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.log_severity_level = 3  # Reduce logging
+        import onnxruntime as ort
         
         # Download ONNX model if not exists
         model_path = "/tmp/model.onnx"
         if not os.path.exists(model_path):
-            logger.info("Downloading ONNX model...")
-            try:
-                response = requests.get(MODEL_URL, timeout=120, stream=True)
-                response.raise_for_status()
-                
-                total_size = 0
-                with open(model_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                        total_size += len(chunk)
-                        
-                logger.info(f"ONNX model downloaded: {total_size / 1024 / 1024:.1f}MB")
-            except Exception as e:
-                logger.error(f"Failed to download model: {e}")
-                ML_ERROR = f"Model download failed: {str(e)}"
-                ML_LOADING = False
-                return False
-        else:
-            logger.info(f"Using existing model: {os.path.getsize(model_path) / 1024 / 1024:.1f}MB")
+            logger.info("📥 Downloading 5MB ONNX model...")
+            
+            # Add timeout and retry logic
+            for attempt in range(3):
+                try:
+                    response = requests.get(MODEL_URL, timeout=60, stream=True)
+                    response.raise_for_status()
+                    
+                    with open(model_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    model_size = os.path.getsize(model_path) / 1024 / 1024
+                    logger.info(f"✅ Model downloaded: {model_size:.1f}MB")
+                    break
+                    
+                except Exception as e:
+                    logger.warning(f"Download attempt {attempt + 1} failed: {e}")
+                    if attempt == 2:
+                        raise
+                    time.sleep(2)
         
-        # Load ONNX model with strict CPU-only execution
+        # Load ONNX model with optimizations
         providers = ['CPUExecutionProvider']
-        provider_options = [{'arena_extend_strategy': 'kSameAsRequested'}]
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
-        logger.info("Creating ONNX inference session with CPU-only execution...")
+        onnx_session = ort.InferenceSession(
+            model_path, 
+            sess_options=sess_options,
+            providers=providers
+        )
         
-        try:
-            onnx_session = ort.InferenceSession(
-                model_path, 
-                sess_options=sess_options,
-                providers=providers,
-                provider_options=provider_options
-            )
-            
-            logger.info("✅ CPU-only ONNX Model loaded successfully!")
-            logger.info(f"Available providers: {onnx_session.get_providers()}")
-            
-            # Get model info
-            input_info = onnx_session.get_inputs()[0]
-            output_info = onnx_session.get_outputs()[0]
-            logger.info(f"Model input: {input_info.name} - {input_info.shape}")
-            logger.info(f"Model output: {output_info.name} - {output_info.shape}")
-            
-        except Exception as e:
-            logger.error(f"Failed to create ONNX session: {e}")
-            ML_ERROR = f"ONNX session creation failed: {str(e)}"
-            ML_LOADING = False
-            return False
-        
+        logger.info("✅ ONNX Model loaded successfully!")
         ML_READY = True
         ML_LOADING = False
         return True
         
     except Exception as e:
-        logger.error(f"Model loading failed: {e}")
+        logger.error(f"❌ Model loading failed: {e}")
         ML_ERROR = str(e)
         ML_LOADING = False
         return False
 
 def preprocess_image(image):
-    """Preprocess image for YOLO inference"""
-    try:
-        original_size = image.size
-        logger.info(f"Original image size: {original_size}")
-        
-        # Convert to RGB if needed
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Resize while maintaining aspect ratio
-        if max(image.size) > MAX_IMAGE_SIZE:
-            ratio = MAX_IMAGE_SIZE / max(image.size)
-            new_size = tuple(int(dim * ratio) for dim in image.size)
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
-        
-        # Convert to numpy array
-        img_array = np.array(image).astype(np.float32)
-        img_array = img_array / 255.0  # Normalize to 0-1
-        
-        # Pad to square (640x640)
-        h, w = img_array.shape[:2]
-        
-        # Create 640x640 square canvas
-        square_img = np.zeros((MAX_IMAGE_SIZE, MAX_IMAGE_SIZE, 3), dtype=np.float32)
-        
-        # Calculate padding to center the image
-        pad_h = (MAX_IMAGE_SIZE - h) // 2
-        pad_w = (MAX_IMAGE_SIZE - w) // 2
-        
-        # Place image in center
-        square_img[pad_h:pad_h+h, pad_w:pad_w+w] = img_array
-        
-        # Transpose to CHW format and add batch dimension
-        img_tensor = square_img.transpose(2, 0, 1)  # HWC to CHW
-        img_tensor = np.expand_dims(img_tensor, axis=0)  # Add batch dimension
-        
-        logger.info(f"Preprocessed tensor shape: {img_tensor.shape}")
-        return img_tensor, original_size, (pad_w, pad_h, w, h)
-        
-    except Exception as e:
-        logger.error(f"Preprocessing error: {e}")
-        raise
+    """Optimized image preprocessing for Railway"""
+    # Resize to save memory
+    if max(image.size) > MAX_IMAGE_SIZE:
+        ratio = MAX_IMAGE_SIZE / max(image.size)
+        new_size = tuple(int(dim * ratio) for dim in image.size)
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    
+    # Convert to RGB if needed
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # Efficient numpy conversion
+    img_array = np.array(image, dtype=np.float32) / 255.0
+    
+    # YOLO format: CHW with batch dimension
+    img_array = img_array.transpose(2, 0, 1)[np.newaxis, :]
+    
+    return img_array, image.size
 
-def postprocess_detections(outputs, original_size, padding_info, conf_threshold=0.25):
-    """Process ONNX model outputs"""
+def postprocess_detections(outputs, original_size, conf_threshold=0.25, nms_threshold=0.4):
+    """Process ONNX model outputs with NMS"""
     detections = []
-    pad_w, pad_h, orig_w, orig_h = padding_info
     
     try:
-        if not outputs or len(outputs) == 0:
-            logger.warning("No outputs from model")
-            return detections
+        predictions = outputs[0][0]  # Remove batch dimension
         
-        # Get the main output tensor
-        predictions = outputs[0]
-        logger.info(f"Model output shape: {predictions.shape}")
-        
-        # Handle batch dimension
-        if len(predictions.shape) == 3:
-            predictions = predictions[0]  # Remove batch dimension
-        
-        # YOLOv5/v8 format: [num_detections, 5 + num_classes]
-        # [x_center, y_center, width, height, confidence, class_scores...]
-        
-        valid_detections = 0
-        for i, detection in enumerate(predictions):
-            if len(detection) < 5:
-                continue
-                
-            # Extract basic info
-            x_center, y_center, width, height, confidence = detection[:5]
+        # Collect valid detections
+        valid_detections = []
+        for detection in predictions:
+            confidence = detection[4]  # Objectness score
             
             if confidence > conf_threshold:
-                valid_detections += 1
+                # Extract bounding box
+                x_center, y_center, width, height = detection[:4]
                 
-                # Get class prediction
-                if len(detection) > 5:
-                    class_scores = detection[5:]
-                    class_id = int(np.argmax(class_scores))
-                    class_confidence = float(class_scores[class_id])
-                    final_confidence = float(confidence * class_confidence)
-                else:
-                    # Single class model
-                    class_id = 0
-                    final_confidence = float(confidence)
+                # Get best class
+                class_scores = detection[5:]
+                class_id = np.argmax(class_scores)
+                class_confidence = class_scores[class_id]
+                
+                final_confidence = confidence * class_confidence
                 
                 if final_confidence > conf_threshold:
-                    # Convert coordinates from model space to original image space
-                    # Model outputs are in 640x640 space, need to account for padding
-                    
-                    # Convert to pixel coordinates in 640x640 space
-                    x_center_px = x_center * MAX_IMAGE_SIZE
-                    y_center_px = y_center * MAX_IMAGE_SIZE
-                    width_px = width * MAX_IMAGE_SIZE
-                    height_px = height * MAX_IMAGE_SIZE
-                    
-                    # Account for padding - translate to original image coordinates
-                    x_center_orig = (x_center_px - pad_w) / orig_w
-                    y_center_orig = (y_center_px - pad_h) / orig_h
-                    width_orig = width_px / orig_w
-                    height_orig = height_px / orig_h
-                    
-                    # Convert center format to top-left corner format
-                    x_corner = x_center_orig - width_orig / 2
-                    y_corner = y_center_orig - height_orig / 2
-                    
-                    # Clamp to valid range [0, 1]
-                    x_corner = max(0, min(1, x_corner))
-                    y_corner = max(0, min(1, y_corner))
-                    width_orig = max(0, min(1, width_orig))
-                    height_orig = max(0, min(1, height_orig))
-                    
-                    # Get class name
-                    class_name = CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"class_{class_id}"
-                    
-                    detections.append({
-                        "className": class_name,
-                        "confidence": final_confidence,
+                    valid_detections.append({
+                        "className": CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"class_{class_id}",
+                        "confidence": float(final_confidence),
                         "boundingBox": {
-                            "x": float(x_corner),
-                            "y": float(y_corner), 
-                            "width": float(width_orig),
-                            "height": float(height_orig)
+                            "x": float(max(0, x_center - width/2)),
+                            "y": float(max(0, y_center - height/2)),
+                            "width": float(min(1, width)),
+                            "height": float(min(1, height))
                         }
                     })
         
-        logger.info(f"Found {valid_detections} detections above confidence threshold")
-        logger.info(f"Returning {len(detections)} final detections")
-        
+        # Simple confidence-based filtering instead of full NMS to save computation
+        valid_detections.sort(key=lambda x: x["confidence"], reverse=True)
+        detections = valid_detections[:10]  # Limit to top 10 detections
+    
     except Exception as e:
-        logger.error(f"Postprocessing error: {e}")
-        logger.error(f"Outputs info: {[out.shape if hasattr(out, 'shape') else type(out) for out in outputs]}")
+        logger.error(f"❌ Postprocessing error: {e}")
     
     return detections
 
 # Flask routes
 @app.route('/', methods=['GET'])
 def health():
-    """Health check endpoint"""
+    """Railway-compatible health check"""
     uptime = time.time() - start_time
     
     return jsonify({
@@ -287,148 +180,114 @@ def health():
         "ml_loading": ML_LOADING,
         "ml_error": ML_ERROR,
         "uptime_seconds": round(uptime, 1),
-        "model_type": "ONNX CPU-only",
+        "model_type": "ONNX (5MB)",
+        "platform": "Railway",
         "endpoints": {
             "health": "/",
-            "detect": "/detect (POST)",
-            "quick_test": "/quick-test"
+            "detect": "/detect"
         },
-        "supported_classes": CLASS_NAMES
-    })
-
-@app.route('/quick-test', methods=['GET'])
-def quick_test():
-    """Quick connectivity test for mobile apps"""
-    return jsonify({
-        "status": "ok",
-        "timestamp": time.time(),
-        "server": "responsive",
-        "ml_ready": ML_READY
+        "limits": {
+            "max_image_size": f"{MAX_CONTENT_LENGTH // 1024 // 1024}MB",
+            "max_resolution": f"{MAX_IMAGE_SIZE}px"
+        }
     })
 
 @app.route('/detect', methods=['POST'])
 def detect():
-    """Main detection endpoint"""
-    start_time_request = time.time()
+    """Lightweight ML detection endpoint"""
     
-    # Check if model is ready
-    if not ML_READY:
-        if ML_LOADING:
-            return jsonify({
-                "success": False,
-                "error": "Model is still loading, please wait...",
-                "retry_after": 30,
-                "status": "loading"
-            }), 503
-        
-        # Try to load model
-        logger.info("Loading model on first request...")
+    # Auto-load model on first request
+    if not ML_READY and not ML_LOADING:
+        logger.info("🚀 First request - initializing model...")
         if not load_onnx_model():
             return jsonify({
                 "success": False,
                 "error": "Model initialization failed",
                 "details": ML_ERROR,
-                "status": "failed"
+                "retry_after": 60
             }), 500
     
+    # Handle loading state
+    if ML_LOADING:
+        return jsonify({
+            "success": False,
+            "error": "Model is still loading, please wait...",
+            "retry_after": 30,
+            "status": "loading"
+        }), 503
+    
+    # Handle failed state
+    if not ML_READY:
+        return jsonify({
+            "success": False,
+            "error": "Model not available",
+            "details": ML_ERROR
+        }), 503
+    
     try:
-        # Extract image from request
-        image_data = None
+        # Get image data
         if 'image' in request.files:
-            file = request.files['image']
-            if file.filename:
-                image_data = file.read()
+            image_data = request.files['image'].read()
         elif request.content_type and 'image' in request.content_type:
             image_data = request.get_data()
-        
-        if not image_data:
+        else:
             return jsonify({
                 "success": False,
-                "error": "No image data found. Send image as 'image' form field or raw data."
+                "error": "No image provided. Send as 'image' file or in request body."
             }), 400
         
-        logger.info(f"Received image data: {len(image_data)} bytes")
+        if not image_data:
+            return jsonify({"success": False, "error": "Empty image data"}), 400
         
-        # Load and validate image
+        # Process image
         try:
             image = Image.open(BytesIO(image_data))
-            logger.info(f"Image loaded: {image.size}, mode: {image.mode}")
+            logger.info(f"📸 Processing image: {image.size}")
         except Exception as e:
             return jsonify({
                 "success": False,
                 "error": f"Invalid image format: {str(e)}"
             }), 400
         
-        # Preprocess image
-        try:
-            processed_image, original_size, padding_info = preprocess_image(image)
-        except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": f"Image preprocessing failed: {str(e)}"
-            }), 500
+        # Preprocess for model
+        processed_image, original_size = preprocess_image(image)
         
         # Run inference
-        try:
-            input_name = onnx_session.get_inputs()[0].name
-            
-            inference_start = time.time()
-            outputs = onnx_session.run(None, {input_name: processed_image})
-            inference_time = time.time() - inference_start
-            
-            logger.info(f"Inference completed in {inference_time:.3f}s")
-            
-        except Exception as e:
-            logger.error(f"Inference failed: {e}")
-            return jsonify({
-                "success": False,
-                "error": f"Model inference failed: {str(e)}"
-            }), 500
+        input_name = onnx_session.get_inputs()[0].name
+        start_inference = time.time()
+        outputs = onnx_session.run(None, {input_name: processed_image})
+        inference_time = time.time() - start_inference
         
-        # Post-process results
-        try:
-            detections = postprocess_detections(outputs, original_size, padding_info)
-        except Exception as e:
-            logger.error(f"Post-processing failed: {e}")
-            return jsonify({
-                "success": False,
-                "error": f"Results processing failed: {str(e)}"
-            }), 500
+        # Process results
+        detections = postprocess_detections(outputs, original_size)
         
-        total_time = time.time() - start_time_request
-        
-        logger.info(f"✅ Detection completed: {len(detections)} objects found in {total_time:.3f}s")
+        logger.info(f"✅ Detection complete: {len(detections)} objects found in {inference_time:.3f}s")
         
         return jsonify({
             "success": True,
             "detections": detections,
             "count": len(detections),
-            "image_size": list(original_size),
-            "processing_time": {
-                "total_seconds": round(total_time, 3),
-                "inference_seconds": round(inference_time, 3)
-            },
-            "model_info": {
-                "type": "ONNX",
-                "provider": "CPU",
-                "classes": len(CLASS_NAMES)
+            "metadata": {
+                "image_size": list(original_size),
+                "inference_time_ms": round(inference_time * 1000, 2),
+                "model_type": "ONNX",
+                "platform": "Railway"
             }
         })
         
     except Exception as e:
-        logger.error(f"Unexpected error in detect endpoint: {e}")
+        logger.error(f"❌ Detection error: {e}")
         return jsonify({
             "success": False,
-            "error": "Internal server error",
-            "details": str(e) if app.debug else None
+            "error": f"Detection failed: {str(e)}"
         }), 500
 
+# Error handlers
 @app.errorhandler(413)
 def file_too_large(e):
     return jsonify({
         "success": False,
-        "error": "File too large",
-        "max_size": "5MB"
+        "error": f"File too large. Maximum size: {MAX_CONTENT_LENGTH // 1024 // 1024}MB"
     }), 413
 
 @app.errorhandler(404)
@@ -436,30 +295,41 @@ def not_found(e):
     return jsonify({
         "success": False,
         "error": "Endpoint not found",
-        "available_endpoints": ["/", "/detect", "/quick-test"]
+        "available_endpoints": ["/", "/detect"]
     }), 404
 
 @app.errorhandler(500)
 def internal_error(e):
-    logger.error(f"Internal server error: {e}")
+    logger.error(f"❌ Internal error: {e}")
     return jsonify({
         "success": False,
         "error": "Internal server error"
     }), 500
 
+# Auto-load model on startup for Railway
+def initialize_model():
+    """Initialize model on startup"""
+    logger.info("🚀 Railway startup - pre-loading model...")
+    load_onnx_model()
+
 if __name__ == '__main__':
-    logger.info("🚀 Starting Gym Equipment Detection API")
-    logger.info(f"Model URL: {MODEL_URL}")
-    logger.info(f"Supported classes: {len(CLASS_NAMES)}")
+    logger.info("🚀 Starting Ultra-Lightweight Gym Detection API")
+    logger.info("📦 Dependencies: Flask, ONNX Runtime, PIL, NumPy only")
+    logger.info("🏋️ Model: 5MB Gym Equipment Detection")
     
+    # Get port from Railway environment
     port = int(os.environ.get('PORT', 5000))
-    debug_mode = os.environ.get('DEBUG', 'false').lower() == 'true'
     
-    logger.info(f"Server starting on port {port}, debug={debug_mode}")
+    # Pre-load model for Railway
+    initialize_model()
     
+    logger.info(f"🌐 Server starting on port {port}")
+    
+    # Railway-optimized settings
     app.run(
         host='0.0.0.0',
         port=port,
-        debug=debug_mode,
-        threaded=True
+        debug=False,
+        threaded=True,
+        use_reloader=False
     )
