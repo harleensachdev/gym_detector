@@ -31,7 +31,7 @@ MAX_IMAGE_SIZE = 640
 MAX_CONTENT_LENGTH = 2 * 1024 * 1024
 
 # Your ONNX model URL
-MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=1JBZHN-gwW4ukfMbfI7N-gIlU8iaXp1I_")
+MODEL_URL = os.getenv("MODEL_URL", "https://drive.google.com/uc?export=download&id=10x_l-SAe3uuoGjIK_wZIOhQ0WBTx79i7")
 CLASS_NAMES = [
     "arm_curl", "chest_fly", "chest_press", "chin_dip", "dumbell",
     "lat_pulldown", "lateral_raises", "leg_curl", "leg_extension",
