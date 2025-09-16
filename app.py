@@ -131,26 +131,49 @@ def postprocess_detections(outputs, original_size, conf_threshold=0.25):
         # OpenCV DNN output handling
         output = outputs[0]
         
-        # Handle different output formats
-        if len(output.shape) == 3:
-            output = output[0]  # Remove batch dimension
+        logger.info(f"Raw output shape: {output.shape}")
         
-        logger.info(f"Output shape: {output.shape}")
+        # Handle YOLO output format - typically (num_features, num_detections)
+        # Need to transpose to (num_detections, num_features)
+        if output.shape[0] < output.shape[1]:
+            output = output.T  # Transpose to get (8400, 18)
+        
+        logger.info(f"Transposed output shape: {output.shape}")
         logger.info(f"Processing {len(output)} potential detections")
+        
+        # Calculate actual number of classes from output shape
+        num_features = output.shape[1]  # Should be 18
+        num_classes = num_features - 5  # 18 - 4 (bbox) - 1 (objectness) = 13
+        
+        logger.info(f"Detected {num_classes} classes in model output")
+        
+        # Use only the classes that exist in the model
+        available_classes = CLASS_NAMES[:num_classes]
+        logger.info(f"Using classes: {available_classes}")
         
         detection_count = 0
         
+        # Add debug output for first few detections
+        for i, detection in enumerate(output[:5]):  # Check first 5 only for debugging
+            logger.info(f"Debug detection {i}: shape={detection.shape}, "
+                       f"first_10_values={detection[:10].tolist()}")
+        
         for i, detection in enumerate(output):
-            if len(detection) < 5 + len(CLASS_NAMES):
+            if len(detection) < 5:
                 continue
                 
             # Extract components - YOLO format: [x, y, w, h, objectness, class_scores...]
             x_center, y_center, width, height = detection[:4]
             objectness = detection[4]
-            class_scores = detection[5:5+len(CLASS_NAMES)]
+            
+            # Get class scores (only as many as the model actually outputs)
+            if len(detection) > 5:
+                class_scores = detection[5:5+num_classes]
+            else:
+                continue
             
             # Apply objectness threshold
-            if objectness > conf_threshold:
+            if objectness > conf_threshold and len(class_scores) > 0:
                 # Find best class
                 class_id = np.argmax(class_scores)
                 class_confidence = class_scores[class_id]
@@ -159,12 +182,12 @@ def postprocess_detections(outputs, original_size, conf_threshold=0.25):
                 final_confidence = float(objectness * class_confidence)
                 
                 # Apply final threshold and validate class
-                if final_confidence > conf_threshold and 0 <= class_id < len(CLASS_NAMES):
-                    # Normalize confidence to 0-1 range (in case it's not already)
+                if final_confidence > conf_threshold and 0 <= class_id < len(available_classes):
+                    # Normalize confidence to 0-1 range
                     final_confidence = min(1.0, max(0.0, final_confidence))
                     
                     # Convert center coordinates to top-left coordinates
-                    # Ensure coordinates are in 0-1 range
+                    # YOLO coordinates are typically already normalized (0-1)
                     x_top_left = max(0.0, min(1.0, float(x_center - width/2)))
                     y_top_left = max(0.0, min(1.0, float(y_center - height/2)))
                     box_width = max(0.0, min(1.0, float(width)))
@@ -179,7 +202,7 @@ def postprocess_detections(outputs, original_size, conf_threshold=0.25):
                     # Only add if box has reasonable size
                     if box_width > 0.01 and box_height > 0.01:
                         detection_obj = {
-                            "className": CLASS_NAMES[class_id],
+                            "className": available_classes[class_id],
                             "confidence": final_confidence,
                             "boundingBox": {
                                 "x": x_top_left,
@@ -192,7 +215,7 @@ def postprocess_detections(outputs, original_size, conf_threshold=0.25):
                         detections.append(detection_obj)
                         detection_count += 1
                         
-                        logger.info(f"Detection {detection_count}: {CLASS_NAMES[class_id]} "
+                        logger.info(f"Detection {detection_count}: {available_classes[class_id]} "
                                   f"conf={final_confidence:.3f} bbox=({x_top_left:.3f}, "
                                   f"{y_top_left:.3f}, {box_width:.3f}, {box_height:.3f})")
                         
@@ -337,7 +360,7 @@ def detect():
         logger.info(f"Raw output shape: {outputs[0].shape if len(outputs) > 0 else 'No outputs'}")
         
         # Process results
-        detections = postprocess_detections(outputs, original_size, conf_threshold=0.3)
+        detections = postprocess_detections(outputs, original_size, conf_threshold=0.1)  # Lower threshold for debugging
         
         logger.info(f"✅ Final result: {len(detections)} valid detections")
         
