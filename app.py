@@ -26,8 +26,8 @@ ML_ERROR = None
 start_time = time.time()
 net = None
 
-# Configuration
-MAX_IMAGE_SIZE = 640
+# Configuration - Updated to 320x320 as per your training
+INPUT_SIZE = 320  # Changed from 640 to 320
 MAX_CONTENT_LENGTH = 2 * 1024 * 1024
 
 # Your ONNX model URL
@@ -40,6 +40,327 @@ CLASS_NAMES = [
 
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
+def letterbox_image(image, target_size=(320, 320), color=(114, 114, 114)):
+    """
+    Resize image with unchanged aspect ratio using padding - EXACTLY like Ultralytics
+    Updated for 320x320 input size
+    """
+    # Get current image dimensions
+    h, w = image.shape[:2]
+    target_h, target_w = target_size
+    
+    # Calculate scaling ratio (same for both dimensions to maintain aspect ratio)
+    ratio = min(target_w / w, target_h / h)
+    
+    # Calculate new dimensions after scaling
+    new_w = int(w * ratio)
+    new_h = int(h * ratio)
+    
+    # Resize the image
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    # Create a new image with target size filled with padding color
+    padded = np.full((target_h, target_w, 3), color, dtype=np.uint8)
+    
+    # Calculate padding offsets to center the image
+    pad_x = (target_w - new_w) // 2
+    pad_y = (target_h - new_h) // 2
+    
+    # Place the resized image in the center of the padded image
+    padded[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+    
+    logger.info(f"Letterboxed: {(w, h)} -> {(new_w, new_h)} -> {target_size}, ratio={ratio:.3f}")
+    
+    return padded, ratio, (pad_x, pad_y)
+
+def preprocess_image_ultralytics_style(image):
+    """
+    Preprocess image EXACTLY like Ultralytics YOLO does for 320x320
+    """
+    # Convert PIL to OpenCV format if needed
+    if isinstance(image, Image.Image):
+        img_array = np.array(image)
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    else:
+        img_array = image.copy()
+    
+    # Apply letterbox resize for 320x320
+    letterboxed, ratio, padding = letterbox_image(img_array, target_size=(INPUT_SIZE, INPUT_SIZE))
+    
+    logger.info(f"Original shape: {img_array.shape}")
+    logger.info(f"Letterboxed shape: {letterboxed.shape}")
+    
+    return letterboxed, ratio, padding, img_array.shape[:2]
+
+def create_ultralytics_blob(img_array):
+    """
+    Create blob exactly like Ultralytics does for 320x320
+    """
+    # Convert BGR to RGB (Ultralytics expects RGB)
+    img_rgb = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+    
+    # Create blob: HWC -> CHW, normalize to 0-1, add batch dimension
+    blob = cv2.dnn.blobFromImage(
+        img_rgb,
+        scalefactor=1.0/255.0,  # Normalize to 0-1
+        size=(INPUT_SIZE, INPUT_SIZE),  # 320x320
+        mean=(0, 0, 0),         # No mean subtraction
+        swapRB=False,           # Already RGB, don't swap
+        crop=False,             # Don't crop (already letterboxed)
+        ddepth=cv2.CV_32F       # Use float32
+    )
+    
+    logger.info(f"Blob shape: {blob.shape}")
+    logger.info(f"Blob dtype: {blob.dtype}")
+    logger.info(f"Blob range: [{blob.min():.6f}, {blob.max():.6f}]")
+    
+    return blob
+
+def postprocess_ultralytics_style(outputs, original_shape, ratio, padding, conf_threshold=0.25):
+    """
+    Postprocess outputs EXACTLY like Ultralytics does for 320x320 model
+    """
+    detections = []
+    
+    try:
+        # Get the output tensor
+        output = outputs[0]  # Shape varies by model
+        
+        logger.info(f"Raw output shape: {output.shape}")
+        
+        # Handle different output formats
+        if len(output.shape) == 3:
+            if output.shape[0] == 1:
+                output = output[0]  # Remove batch dim: (features, detections)
+            else:
+                logger.info(f"Unexpected 3D shape: {output.shape}")
+        
+        # Ensure we have (num_detections, num_features) format
+        if len(output.shape) == 2:
+            if output.shape[0] < output.shape[1]:
+                output = output.T  # Transpose to (detections, features)
+        
+        logger.info(f"Processed output shape: {output.shape}")
+        
+        if len(output.shape) != 2:
+            logger.error(f"Cannot process output shape: {output.shape}")
+            return []
+        
+        num_detections, num_features = output.shape
+        logger.info(f"Processing {num_detections} detections with {num_features} features each")
+        
+        # Determine the format based on number of features
+        if num_features == len(CLASS_NAMES) + 4:
+            # YOLOv8 format: [x, y, w, h, class_0, class_1, ..., class_n]
+            boxes = output[:, :4]
+            class_confidences = output[:, 4:]
+            logger.info("Detected YOLOv8 format (no objectness)")
+        elif num_features == len(CLASS_NAMES) + 5:
+            # YOLOv5 format: [x, y, w, h, objectness, class_0, class_1, ..., class_n]
+            boxes = output[:, :4]
+            objectness = output[:, 4]
+            class_confidences = output[:, 5:]
+            logger.info("Detected YOLOv5 format (with objectness)")
+        else:
+            # Try to auto-detect
+            expected_classes = num_features - 4  # Assume no objectness
+            if expected_classes > 0 and expected_classes <= len(CLASS_NAMES):
+                boxes = output[:, :4]
+                class_confidences = output[:, 4:]
+                logger.info(f"Auto-detected format: {expected_classes} classes, no objectness")
+            else:
+                expected_classes = num_features - 5  # Assume with objectness
+                if expected_classes > 0 and expected_classes <= len(CLASS_NAMES):
+                    boxes = output[:, :4]
+                    objectness = output[:, 4]
+                    class_confidences = output[:, 5:]
+                    logger.info(f"Auto-detected format: {expected_classes} classes, with objectness")
+                else:
+                    logger.error(f"Cannot determine output format. Features: {num_features}, Expected classes: {len(CLASS_NAMES)}")
+                    return []
+        
+        logger.info(f"Boxes shape: {boxes.shape}")
+        logger.info(f"Class confidences shape: {class_confidences.shape}")
+        logger.info(f"Max class confidence: {class_confidences.max():.6f}")
+        logger.info(f"Mean class confidence: {class_confidences.mean():.6f}")
+        
+        # Use only available classes
+        available_classes = min(class_confidences.shape[1], len(CLASS_NAMES))
+        logger.info(f"Using {available_classes} classes")
+        
+        # Find detections above threshold
+        valid_detections = 0
+        for i in range(num_detections):
+            # Get class confidences for this detection
+            class_scores = class_confidences[i, :available_classes]
+            max_conf = np.max(class_scores)
+            class_id = np.argmax(class_scores)
+            
+            # Apply objectness if available
+            final_confidence = max_conf
+            if 'objectness' in locals():
+                final_confidence = max_conf * objectness[i]
+            
+            # Check confidence threshold
+            if final_confidence >= conf_threshold:
+                # Extract box coordinates (in normalized space relative to input size)
+                x_center, y_center, width, height = boxes[i]
+                
+                # Convert from center format to corner format
+                x1 = x_center - width / 2
+                y1 = y_center - height / 2
+                x2 = x_center + width / 2
+                y2 = y_center + height / 2
+                
+                # Adjust for letterbox padding and scaling
+                pad_x, pad_y = padding
+                
+                # Remove padding (convert from INPUT_SIZE space to original space)
+                x1 = (x1 * INPUT_SIZE - pad_x) / ratio
+                y1 = (y1 * INPUT_SIZE - pad_y) / ratio
+                x2 = (x2 * INPUT_SIZE - pad_x) / ratio
+                y2 = (y2 * INPUT_SIZE - pad_y) / ratio
+                
+                # Normalize to original image size
+                orig_h, orig_w = original_shape
+                x1 /= orig_w
+                y1 /= orig_h
+                x2 /= orig_w
+                y2 /= orig_h
+                
+                # Clamp to valid range
+                x1 = max(0.0, min(1.0, x1))
+                y1 = max(0.0, min(1.0, y1))
+                x2 = max(0.0, min(1.0, x2))
+                y2 = max(0.0, min(1.0, y2))
+                
+                # Calculate final width and height
+                box_width = x2 - x1
+                box_height = y2 - y1
+                
+                # Only keep reasonable sized boxes
+                if box_width > 0.01 and box_height > 0.01 and 0 <= class_id < available_classes:
+                    detection = {
+                        "className": CLASS_NAMES[class_id],
+                        "confidence": float(final_confidence),
+                        "boundingBox": {
+                            "x": float(x1),
+                            "y": float(y1),
+                            "width": float(box_width),
+                            "height": float(box_height)
+                        }
+                    }
+                    
+                    detections.append(detection)
+                    valid_detections += 1
+                    
+                    if valid_detections <= 5:  # Log first 5
+                        logger.info(f"Detection {valid_detections}: {CLASS_NAMES[class_id]} "
+                                   f"conf={final_confidence:.3f} "
+                                   f"box=({x1:.3f},{y1:.3f},{box_width:.3f},{box_height:.3f})")
+                    
+                    if valid_detections >= 50:  # Limit total detections
+                        break
+    
+    except Exception as e:
+        logger.error(f"❌ Postprocessing error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    
+    # Sort by confidence and apply basic NMS if needed
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    # Simple NMS to remove overlapping detections
+    filtered_detections = []
+    for det in detections:
+        is_duplicate = False
+        for existing in filtered_detections:
+            if det['className'] == existing['className']:
+                # Calculate IoU
+                iou = calculate_iou(det['boundingBox'], existing['boundingBox'])
+                if iou > 0.5:  # Remove if IoU > 0.5
+                    is_duplicate = True
+                    break
+        
+        if not is_duplicate:
+            filtered_detections.append(det)
+        
+        if len(filtered_detections) >= 10:  # Limit to top 10
+            break
+    
+    logger.info(f"Found {len(detections)} raw detections, {len(filtered_detections)} after NMS")
+    
+    return filtered_detections
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union of two bounding boxes"""
+    try:
+        # Extract coordinates
+        x1_1, y1_1 = box1['x'], box1['y']
+        x2_1, y2_1 = x1_1 + box1['width'], y1_1 + box1['height']
+        
+        x1_2, y1_2 = box2['x'], box2['y']
+        x2_2, y2_2 = x1_2 + box2['width'], y1_2 + box2['height']
+        
+        # Calculate intersection
+        x_left = max(x1_1, x1_2)
+        y_top = max(y1_1, y1_2)
+        x_right = min(x2_1, x2_2)
+        y_bottom = min(y2_1, y2_2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+        
+        intersection = (x_right - x_left) * (y_bottom - y_top)
+        
+        # Calculate union
+        area1 = box1['width'] * box1['height']
+        area2 = box2['width'] * box2['height']
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    except:
+        return 0.0
+
+def detect_ultralytics_style(image_data, net, conf_threshold=0.25):
+    """
+    Main detection function that mimics Ultralytics exactly for 320x320
+    """
+    try:
+        # Load image
+        image = Image.open(BytesIO(image_data))
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        logger.info(f"📷 Input image: {image.size}")
+        
+        # Preprocess exactly like Ultralytics for 320x320
+        processed_img, ratio, padding, original_shape = preprocess_image_ultralytics_style(image)
+        
+        # Create blob
+        blob = create_ultralytics_blob(processed_img)
+        
+        # Run inference
+        start_time = time.time()
+        net.setInput(blob)
+        outputs = net.forward()
+        inference_time = time.time() - start_time
+        
+        logger.info(f"⚡ Inference completed in {inference_time:.3f}s")
+        
+        # Postprocess exactly like Ultralytics
+        detections = postprocess_ultralytics_style(
+            outputs, original_shape, ratio, padding, conf_threshold
+        )
+        
+        return detections, inference_time
+        
+    except Exception as e:
+        logger.error(f"❌ Detection failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return [], 0.0
+
 def load_opencv_model():
     """Load ONNX model using OpenCV DNN - Railway compatible!"""
     global ML_READY, ML_LOADING, ML_ERROR, net
@@ -48,18 +369,18 @@ def load_opencv_model():
         return ML_READY
     
     ML_LOADING = True
-    logger.info("🚀 Loading 5MB ONNX model with OpenCV DNN (Railway compatible)...")
+    logger.info(f"🚀 Loading ONNX model with OpenCV DNN (input size: {INPUT_SIZE}x{INPUT_SIZE})...")
     
     try:
         # Download model
         model_path = "/tmp/model.onnx"
         if not os.path.exists(model_path):
-            logger.info("📥 Downloading 5MB model from Google Drive...")
+            logger.info("📥 Downloading model from Google Drive...")
             start_download = time.time()
             
             response = requests.get(
                 MODEL_URL, 
-                timeout=30,
+                timeout=60,
                 stream=True,
                 headers={'User-Agent': 'Railway-OpenCV-Server/1.0'}
             )
@@ -74,7 +395,7 @@ def load_opencv_model():
             model_size = os.path.getsize(model_path) / 1024 / 1024
             logger.info(f"✅ Model downloaded: {model_size:.1f}MB in {download_time:.1f}s")
         
-        # Load with OpenCV DNN (no executable stack issues!)
+        # Load with OpenCV DNN
         logger.info("🔄 Loading ONNX model with OpenCV DNN...")
         start_load = time.time()
         
@@ -89,151 +410,15 @@ def load_opencv_model():
         
         ML_READY = True
         ML_LOADING = False
-        logger.info("🎉 5MB ONNX model fully loaded with OpenCV DNN!")
+        logger.info(f"🎉 Model ready! Input size: {INPUT_SIZE}x{INPUT_SIZE}, Classes: {len(CLASS_NAMES)}")
         return True
         
     except Exception as e:
-        error_msg = f"OpenCV model loading failed: {str(e)}"
+        error_msg = f"Model loading failed: {str(e)}"
         logger.error(f"❌ {error_msg}")
         ML_ERROR = error_msg
         ML_LOADING = False
         return False
-
-def preprocess_image(image):
-    """Preprocess image for YOLO model"""
-    # Resize maintaining aspect ratio
-    target_size = 640
-    w, h = image.size
-    
-    # Calculate new dimensions
-    if w > h:
-        new_w = target_size
-        new_h = int(h * target_size / w)
-    else:
-        new_h = target_size
-        new_w = int(w * target_size / h)
-    
-    # Resize image
-    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    # Convert to OpenCV format
-    img_array = np.array(image)
-    if len(img_array.shape) == 3:
-        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    
-    return img_array, (w, h)  # Return original size
-
-def postprocess_detections(outputs, original_size, conf_threshold=0.25):
-    """Process OpenCV DNN outputs with proper YOLO format"""
-    detections = []
-    
-    try:
-        # OpenCV DNN output handling
-        output = outputs[0]
-        
-        logger.info(f"Raw output shape: {output.shape}")
-        
-        # Handle YOLO output format - typically (num_features, num_detections)
-        # Need to transpose to (num_detections, num_features)
-        if output.shape[0] < output.shape[1]:
-            output = output.T  # Transpose to get (8400, 18)
-        
-        logger.info(f"Transposed output shape: {output.shape}")
-        logger.info(f"Processing {len(output)} potential detections")
-        
-        # Calculate actual number of classes from output shape
-        num_features = output.shape[1]  # Should be 18
-        num_classes = num_features - 5  # 18 - 4 (bbox) - 1 (objectness) = 13
-        
-        logger.info(f"Detected {num_classes} classes in model output")
-        
-        # Use only the classes that exist in the model
-        available_classes = CLASS_NAMES[:num_classes]
-        logger.info(f"Using classes: {available_classes}")
-        
-        detection_count = 0
-        
-        # Add debug output for first few detections
-        for i, detection in enumerate(output[:5]):  # Check first 5 only for debugging
-            logger.info(f"Debug detection {i}: shape={detection.shape}, "
-                       f"first_10_values={detection[:10].tolist()}")
-        
-        for i, detection in enumerate(output):
-            if len(detection) < 5:
-                continue
-                
-            # Extract components - YOLO format: [x, y, w, h, objectness, class_scores...]
-            x_center, y_center, width, height = detection[:4]
-            objectness = detection[4]
-            
-            # Get class scores (only as many as the model actually outputs)
-            if len(detection) > 5:
-                class_scores = detection[5:5+num_classes]
-            else:
-                continue
-            
-            # Apply objectness threshold
-            if objectness > conf_threshold and len(class_scores) > 0:
-                # Find best class
-                class_id = np.argmax(class_scores)
-                class_confidence = class_scores[class_id]
-                
-                # Combined confidence
-                final_confidence = float(objectness * class_confidence)
-                
-                # Apply final threshold and validate class
-                if final_confidence > conf_threshold and 0 <= class_id < len(available_classes):
-                    # Normalize confidence to 0-1 range
-                    final_confidence = min(1.0, max(0.0, final_confidence))
-                    
-                    # Convert center coordinates to top-left coordinates
-                    # YOLO coordinates are typically already normalized (0-1)
-                    x_top_left = max(0.0, min(1.0, float(x_center - width/2)))
-                    y_top_left = max(0.0, min(1.0, float(y_center - height/2)))
-                    box_width = max(0.0, min(1.0, float(width)))
-                    box_height = max(0.0, min(1.0, float(height)))
-                    
-                    # Ensure box stays within bounds
-                    if x_top_left + box_width > 1.0:
-                        box_width = 1.0 - x_top_left
-                    if y_top_left + box_height > 1.0:
-                        box_height = 1.0 - y_top_left
-                    
-                    # Only add if box has reasonable size
-                    if box_width > 0.01 and box_height > 0.01:
-                        detection_obj = {
-                            "className": available_classes[class_id],
-                            "confidence": final_confidence,
-                            "boundingBox": {
-                                "x": x_top_left,
-                                "y": y_top_left,
-                                "width": box_width,
-                                "height": box_height
-                            }
-                        }
-                        
-                        detections.append(detection_obj)
-                        detection_count += 1
-                        
-                        logger.info(f"Detection {detection_count}: {available_classes[class_id]} "
-                                  f"conf={final_confidence:.3f} bbox=({x_top_left:.3f}, "
-                                  f"{y_top_left:.3f}, {box_width:.3f}, {box_height:.3f})")
-                        
-                        if detection_count >= 50:  # Limit detections
-                            break
-    
-    except Exception as e:
-        logger.error(f"❌ Postprocessing error: {e}")
-        logger.error(f"Output shape: {outputs[0].shape if len(outputs) > 0 else 'No outputs'}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
-    
-    # Sort by confidence and return top detections
-    detections.sort(key=lambda x: x['confidence'], reverse=True)
-    final_detections = detections[:10]  # Return top 10
-    
-    logger.info(f"Returning {len(final_detections)} valid detections")
-    return final_detections
 
 @app.route('/', methods=['GET'])
 def health():
@@ -244,57 +429,48 @@ def health():
         logger.warning(f"⚠️ Health check - Model not ready (uptime: {uptime:.1f}s)")
         return jsonify({
             "status": "starting",
-            "service": "Gym Detection API (OpenCV DNN)",
+            "service": "Gym Detection API (320x320)",
             "model_ready": False,
             "uptime": round(uptime, 1),
             "error": ML_ERROR
         }), 503
     
-    logger.info(f"✅ Health check passed - OpenCV model ready")
+    logger.info(f"✅ Health check passed")
     return jsonify({
         "status": "healthy",
         "service": "Gym Detection API",
         "model_ready": True,
         "uptime_seconds": round(uptime, 1),
         "backend": "OpenCV DNN",
-        "model_size": "5MB ONNX"
+        "input_size": f"{INPUT_SIZE}x{INPUT_SIZE}",
+        "classes": len(CLASS_NAMES)
     }), 200
 
 @app.route('/quick-test', methods=['GET'])
 def quick_test():
-    """Quick test endpoint that iOS app is calling"""
+    """Quick test endpoint"""
     uptime = time.time() - start_time
     
     if not ML_READY:
         return jsonify({
             "status": "loading",
-            "service": "Gym Detection API",
             "model_ready": False,
-            "uptime": round(uptime, 1),
-            "message": "Model still loading..."
+            "uptime": round(uptime, 1)
         }), 503
     
     return jsonify({
         "status": "ok",
-        "service": "Gym Detection API",
         "model_ready": True,
         "uptime": round(uptime, 1),
-        "message": "Quick test successful",
-        "classes_available": len(CLASS_NAMES),
-        "sample_classes": CLASS_NAMES[:5]
+        "input_size": f"{INPUT_SIZE}x{INPUT_SIZE}",
+        "classes": CLASS_NAMES
     }), 200
 
 @app.route('/detect', methods=['POST'])
 def detect():
-    """Detection endpoint using OpenCV DNN"""
+    """Detection endpoint using Ultralytics-compatible processing"""
     
     if not ML_READY:
-        if ML_LOADING:
-            return jsonify({
-                "success": False,
-                "error": "Model loading, please wait...",
-                "retry_after": 30
-            }), 503
         return jsonify({
             "success": False,
             "error": "Model not ready",
@@ -302,7 +478,7 @@ def detect():
         }), 503
     
     try:
-        # Get image from request
+        # Get image data
         image_data = None
         if 'image' in request.files:
             image_data = request.files['image'].read()
@@ -311,76 +487,42 @@ def detect():
         else:
             return jsonify({
                 "success": False,
-                "error": "No image provided. Send as 'image' file or raw image data."
+                "error": "No image provided. Send as 'image' file or raw data."
             }), 400
         
         if not image_data or len(image_data) == 0:
             return jsonify({
-                "success": False, 
+                "success": False,
                 "error": "Empty image data received"
             }), 400
         
-        logger.info(f"📸 Processing image of size {len(image_data)} bytes")
+        logger.info(f"📸 Processing image: {len(image_data)} bytes")
         
-        # Process image
-        try:
-            image = Image.open(BytesIO(image_data))
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            logger.info(f"Image loaded: {image.size}, mode: {image.mode}")
-        except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": f"Invalid image format: {str(e)}"
-            }), 400
-        
-        # Preprocess image
-        img_array, original_size = preprocess_image(image)
-        logger.info(f"Image preprocessed to {img_array.shape}")
-        
-        # Create blob for OpenCV DNN
-        blob = cv2.dnn.blobFromImage(
-            img_array, 
-            1/255.0,          # Scale factor (normalize to 0-1)
-            (640, 640),       # Target size
-            (0, 0, 0),        # Mean subtraction
-            swapRB=True,      # Swap R and B channels
-            crop=False        # Don't crop, just resize
+        # Use Ultralytics-compatible detection
+        detections, inference_time = detect_ultralytics_style(
+            image_data, 
+            net, 
+            conf_threshold=0.25
         )
         
-        logger.info(f"Blob created with shape: {blob.shape}")
+        logger.info(f"✅ Detection complete: {len(detections)} objects found")
         
-        # Run inference with OpenCV DNN
-        start_inference = time.time()
-        net.setInput(blob)
-        outputs = net.forward()
-        inference_time = time.time() - start_inference
-        
-        logger.info(f"Inference completed in {inference_time:.3f}s")
-        logger.info(f"Raw output shape: {outputs[0].shape if len(outputs) > 0 else 'No outputs'}")
-        
-        # Process results
-        detections = postprocess_detections(outputs, original_size, conf_threshold=0.1)  # Lower threshold for debugging
-        
-        logger.info(f"✅ Final result: {len(detections)} valid detections")
-        
-        # Log detection summary
-        if detections:
-            for i, det in enumerate(detections[:3]):
-                logger.info(f"  Top {i+1}: {det['className']} ({det['confidence']:.1%})")
+        # Log top detections
+        for i, det in enumerate(detections[:3]):
+            logger.info(f"  #{i+1}: {det['className']} ({det['confidence']:.1%})")
         
         response_data = {
             "success": True,
             "detections": detections,
             "count": len(detections),
             "metadata": {
-                "image_size": list(original_size),
-                "processed_size": [640, 640],
                 "inference_time_ms": round(inference_time * 1000, 2),
                 "backend": "OpenCV DNN",
                 "platform": "Railway",
+                "input_size": f"{INPUT_SIZE}x{INPUT_SIZE}",
                 "model_classes": len(CLASS_NAMES),
-                "confidence_threshold": 0.3
+                "confidence_threshold": 0.25,
+                "processing": "Ultralytics-compatible"
             }
         }
         
@@ -399,15 +541,16 @@ def detect():
 
 @app.route('/debug/info', methods=['GET'])
 def debug_info():
-    """Debug endpoint to check model state"""
+    """Debug endpoint"""
     return jsonify({
         "model_ready": ML_READY,
         "model_loading": ML_LOADING,
         "model_error": ML_ERROR,
         "uptime": time.time() - start_time,
+        "input_size": f"{INPUT_SIZE}x{INPUT_SIZE}",
         "class_names": CLASS_NAMES,
         "class_count": len(CLASS_NAMES),
-        "max_image_size": MAX_IMAGE_SIZE
+        "processing": "Ultralytics-compatible"
     })
 
 @app.errorhandler(413)
@@ -434,24 +577,24 @@ def internal_error(e):
     }), 500
 
 if __name__ == '__main__':
-    logger.info("🚀 Starting Gym Detection API with OpenCV DNN")
-    logger.info("📦 Backend: OpenCV DNN (Railway compatible)")
-    logger.info("🏋️ Model: 5MB ONNX")
-    logger.info(f"🎯 Classes: {len(CLASS_NAMES)} gym equipment types")
+    logger.info("🚀 Starting Gym Detection API with Ultralytics-Compatible Processing")
+    logger.info(f"📦 Backend: OpenCV DNN")
+    logger.info(f"🎯 Input Size: {INPUT_SIZE}x{INPUT_SIZE} (matching your training)")
+    logger.info(f"🏋️ Classes: {len(CLASS_NAMES)} gym equipment types")
     
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🌐 Port: {port}")
     
-    # Pre-load model with OpenCV
-    logger.info("⚡ PRE-LOADING MODEL WITH OPENCV DNN...")
+    # Pre-load model
+    logger.info("⚡ PRE-LOADING MODEL...")
     startup_start = time.time()
     
     if load_opencv_model():
         startup_time = time.time() - startup_start
-        logger.info(f"🎉 SUCCESS! OpenCV model loaded in {startup_time:.1f}s")
+        logger.info(f"🎉 SUCCESS! Model loaded in {startup_time:.1f}s")
         logger.info(f"📋 Available classes: {', '.join(CLASS_NAMES[:5])}...")
     else:
-        logger.error("❌ OpenCV model loading failed")
+        logger.error("❌ Model loading failed")
         logger.error(f"Error: {ML_ERROR}")
         sys.exit(1)
     
