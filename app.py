@@ -101,55 +101,116 @@ def load_opencv_model():
 
 def preprocess_image(image):
     """Preprocess image for YOLO model"""
-    # Resize
-    if max(image.size) > MAX_IMAGE_SIZE:
-        ratio = MAX_IMAGE_SIZE / max(image.size)
-        new_size = tuple(int(dim * ratio) for dim in image.size)
-        image = image.resize(new_size, Image.Resampling.LANCZOS)
+    # Resize maintaining aspect ratio
+    target_size = 640
+    w, h = image.size
+    
+    # Calculate new dimensions
+    if w > h:
+        new_w = target_size
+        new_h = int(h * target_size / w)
+    else:
+        new_h = target_size
+        new_w = int(w * target_size / h)
+    
+    # Resize image
+    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
     
     # Convert to OpenCV format
     img_array = np.array(image)
     if len(img_array.shape) == 3:
         img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
     
-    return img_array, image.size
+    return img_array, (w, h)  # Return original size
 
 def postprocess_detections(outputs, original_size, conf_threshold=0.25):
-    """Process OpenCV DNN outputs"""
+    """Process OpenCV DNN outputs with proper YOLO format"""
     detections = []
     
     try:
-        # OpenCV DNN output format
-        for detection in outputs[0]:
-            confidence = detection[4]
+        # OpenCV DNN output handling
+        output = outputs[0]
+        
+        # Handle different output formats
+        if len(output.shape) == 3:
+            output = output[0]  # Remove batch dimension
+        
+        logger.info(f"Output shape: {output.shape}")
+        logger.info(f"Processing {len(output)} potential detections")
+        
+        detection_count = 0
+        
+        for i, detection in enumerate(output):
+            if len(detection) < 5 + len(CLASS_NAMES):
+                continue
+                
+            # Extract components - YOLO format: [x, y, w, h, objectness, class_scores...]
+            x_center, y_center, width, height = detection[:4]
+            objectness = detection[4]
+            class_scores = detection[5:5+len(CLASS_NAMES)]
             
-            if confidence > conf_threshold:
-                # Get class scores
-                scores = detection[5:]
-                class_id = np.argmax(scores)
-                class_confidence = scores[class_id]
+            # Apply objectness threshold
+            if objectness > conf_threshold:
+                # Find best class
+                class_id = np.argmax(class_scores)
+                class_confidence = class_scores[class_id]
                 
-                final_confidence = confidence * class_confidence
+                # Combined confidence
+                final_confidence = float(objectness * class_confidence)
                 
-                if final_confidence > conf_threshold:
-                    # Extract bounding box
-                    x_center, y_center, width, height = detection[:4]
+                # Apply final threshold and validate class
+                if final_confidence > conf_threshold and 0 <= class_id < len(CLASS_NAMES):
+                    # Normalize confidence to 0-1 range (in case it's not already)
+                    final_confidence = min(1.0, max(0.0, final_confidence))
                     
-                    detections.append({
-                        "className": CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"class_{class_id}",
-                        "confidence": float(final_confidence),
-                        "boundingBox": {
-                            "x": float(max(0, x_center - width/2)),
-                            "y": float(max(0, y_center - height/2)),
-                            "width": float(min(1, width)),
-                            "height": float(min(1, height))
+                    # Convert center coordinates to top-left coordinates
+                    # Ensure coordinates are in 0-1 range
+                    x_top_left = max(0.0, min(1.0, float(x_center - width/2)))
+                    y_top_left = max(0.0, min(1.0, float(y_center - height/2)))
+                    box_width = max(0.0, min(1.0, float(width)))
+                    box_height = max(0.0, min(1.0, float(height)))
+                    
+                    # Ensure box stays within bounds
+                    if x_top_left + box_width > 1.0:
+                        box_width = 1.0 - x_top_left
+                    if y_top_left + box_height > 1.0:
+                        box_height = 1.0 - y_top_left
+                    
+                    # Only add if box has reasonable size
+                    if box_width > 0.01 and box_height > 0.01:
+                        detection_obj = {
+                            "className": CLASS_NAMES[class_id],
+                            "confidence": final_confidence,
+                            "boundingBox": {
+                                "x": x_top_left,
+                                "y": y_top_left,
+                                "width": box_width,
+                                "height": box_height
+                            }
                         }
-                    })
+                        
+                        detections.append(detection_obj)
+                        detection_count += 1
+                        
+                        logger.info(f"Detection {detection_count}: {CLASS_NAMES[class_id]} "
+                                  f"conf={final_confidence:.3f} bbox=({x_top_left:.3f}, "
+                                  f"{y_top_left:.3f}, {box_width:.3f}, {box_height:.3f})")
+                        
+                        if detection_count >= 50:  # Limit detections
+                            break
     
     except Exception as e:
         logger.error(f"❌ Postprocessing error: {e}")
+        logger.error(f"Output shape: {outputs[0].shape if len(outputs) > 0 else 'No outputs'}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
     
-    return detections
+    # Sort by confidence and return top detections
+    detections.sort(key=lambda x: x['confidence'], reverse=True)
+    final_detections = detections[:10]  # Return top 10
+    
+    logger.info(f"Returning {len(final_detections)} valid detections")
+    return final_detections
 
 @app.route('/', methods=['GET'])
 def health():
@@ -176,6 +237,30 @@ def health():
         "model_size": "5MB ONNX"
     }), 200
 
+@app.route('/quick-test', methods=['GET'])
+def quick_test():
+    """Quick test endpoint that iOS app is calling"""
+    uptime = time.time() - start_time
+    
+    if not ML_READY:
+        return jsonify({
+            "status": "loading",
+            "service": "Gym Detection API",
+            "model_ready": False,
+            "uptime": round(uptime, 1),
+            "message": "Model still loading..."
+        }), 503
+    
+    return jsonify({
+        "status": "ok",
+        "service": "Gym Detection API",
+        "model_ready": True,
+        "uptime": round(uptime, 1),
+        "message": "Quick test successful",
+        "classes_available": len(CLASS_NAMES),
+        "sample_classes": CLASS_NAMES[:5]
+    }), 200
+
 @app.route('/detect', methods=['POST'])
 def detect():
     """Detection endpoint using OpenCV DNN"""
@@ -184,7 +269,7 @@ def detect():
         if ML_LOADING:
             return jsonify({
                 "success": False,
-                "error": "Model loading...",
+                "error": "Model loading, please wait...",
                 "retry_after": 30
             }), 503
         return jsonify({
@@ -194,7 +279,8 @@ def detect():
         }), 503
     
     try:
-        # Get image
+        # Get image from request
+        image_data = None
         if 'image' in request.files:
             image_data = request.files['image'].read()
         elif request.content_type and 'image' in request.content_type:
@@ -202,34 +288,44 @@ def detect():
         else:
             return jsonify({
                 "success": False,
-                "error": "No image provided"
+                "error": "No image provided. Send as 'image' file or raw image data."
             }), 400
         
-        if not image_data:
-            return jsonify({"success": False, "error": "Empty image"}), 400
+        if not image_data or len(image_data) == 0:
+            return jsonify({
+                "success": False, 
+                "error": "Empty image data received"
+            }), 400
+        
+        logger.info(f"📸 Processing image of size {len(image_data)} bytes")
         
         # Process image
         try:
             image = Image.open(BytesIO(image_data))
-            logger.info(f"📸 Processing image: {image.size}")
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            logger.info(f"Image loaded: {image.size}, mode: {image.mode}")
         except Exception as e:
             return jsonify({
                 "success": False,
-                "error": f"Invalid image: {str(e)}"
+                "error": f"Invalid image format: {str(e)}"
             }), 400
         
-        # Preprocess
+        # Preprocess image
         img_array, original_size = preprocess_image(image)
+        logger.info(f"Image preprocessed to {img_array.shape}")
         
         # Create blob for OpenCV DNN
         blob = cv2.dnn.blobFromImage(
             img_array, 
-            1/255.0,  # Scale factor
-            (640, 640),  # Size
-            (0, 0, 0),  # Mean
-            True,  # Swap RB
-            crop=False
+            1/255.0,          # Scale factor (normalize to 0-1)
+            (640, 640),       # Target size
+            (0, 0, 0),        # Mean subtraction
+            swapRB=True,      # Swap R and B channels
+            crop=False        # Don't crop, just resize
         )
+        
+        logger.info(f"Blob created with shape: {blob.shape}")
         
         # Run inference with OpenCV DNN
         start_inference = time.time()
@@ -237,59 +333,106 @@ def detect():
         outputs = net.forward()
         inference_time = time.time() - start_inference
         
+        logger.info(f"Inference completed in {inference_time:.3f}s")
+        logger.info(f"Raw output shape: {outputs[0].shape if len(outputs) > 0 else 'No outputs'}")
+        
         # Process results
-        detections = postprocess_detections(outputs, original_size)
+        detections = postprocess_detections(outputs, original_size, conf_threshold=0.3)
         
-        logger.info(f"✅ OpenCV detection: {len(detections)} objects in {inference_time:.3f}s")
+        logger.info(f"✅ Final result: {len(detections)} valid detections")
         
-        return jsonify({
+        # Log detection summary
+        if detections:
+            for i, det in enumerate(detections[:3]):
+                logger.info(f"  Top {i+1}: {det['className']} ({det['confidence']:.1%})")
+        
+        response_data = {
             "success": True,
             "detections": detections,
             "count": len(detections),
             "metadata": {
                 "image_size": list(original_size),
+                "processed_size": [640, 640],
                 "inference_time_ms": round(inference_time * 1000, 2),
                 "backend": "OpenCV DNN",
-                "platform": "Railway"
+                "platform": "Railway",
+                "model_classes": len(CLASS_NAMES),
+                "confidence_threshold": 0.3
             }
-        })
+        }
+        
+        return jsonify(response_data)
         
     except Exception as e:
-        logger.error(f"❌ Detection error: {e}")
+        logger.error(f"❌ Detection error: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        
         return jsonify({
             "success": False,
-            "error": f"Detection failed: {str(e)}"
+            "error": f"Detection failed: {str(e)}",
+            "type": "internal_error"
         }), 500
+
+@app.route('/debug/info', methods=['GET'])
+def debug_info():
+    """Debug endpoint to check model state"""
+    return jsonify({
+        "model_ready": ML_READY,
+        "model_loading": ML_LOADING,
+        "model_error": ML_ERROR,
+        "uptime": time.time() - start_time,
+        "class_names": CLASS_NAMES,
+        "class_count": len(CLASS_NAMES),
+        "max_image_size": MAX_IMAGE_SIZE
+    })
 
 @app.errorhandler(413)
 def file_too_large(e):
-    return jsonify({"success": False, "error": "File too large (max 2MB)"}), 413
+    return jsonify({
+        "success": False, 
+        "error": f"File too large (max {MAX_CONTENT_LENGTH//1024//1024}MB)"
+    }), 413
 
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({"success": False, "error": "Not found"}), 404
+    return jsonify({
+        "success": False, 
+        "error": "Endpoint not found",
+        "available_endpoints": ["/", "/detect", "/quick-test", "/debug/info"]
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return jsonify({
+        "success": False,
+        "error": "Internal server error"
+    }), 500
 
 if __name__ == '__main__':
     logger.info("🚀 Starting Gym Detection API with OpenCV DNN")
     logger.info("📦 Backend: OpenCV DNN (Railway compatible)")
     logger.info("🏋️ Model: 5MB ONNX")
+    logger.info(f"🎯 Classes: {len(CLASS_NAMES)} gym equipment types")
     
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"🌐 Port: {port}")
     
-    # Pre-load model with OpenCV (no executable stack issues!)
+    # Pre-load model with OpenCV
     logger.info("⚡ PRE-LOADING MODEL WITH OPENCV DNN...")
     startup_start = time.time()
     
     if load_opencv_model():
         startup_time = time.time() - startup_start
         logger.info(f"🎉 SUCCESS! OpenCV model loaded in {startup_time:.1f}s")
+        logger.info(f"📋 Available classes: {', '.join(CLASS_NAMES[:5])}...")
     else:
         logger.error("❌ OpenCV model loading failed")
         logger.error(f"Error: {ML_ERROR}")
         sys.exit(1)
     
-    logger.info(f"🚀 Starting Flask server...")
+    logger.info(f"🚀 Starting Flask server on 0.0.0.0:{port}")
     
     app.run(
         host='0.0.0.0',
